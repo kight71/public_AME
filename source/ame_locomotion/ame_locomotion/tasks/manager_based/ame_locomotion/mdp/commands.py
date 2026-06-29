@@ -213,6 +213,12 @@ class FootstepPlanCommand(CommandTerm):
 
         self._commit_plan(env_ids)
         self.target_w[env_ids] = self.plan_buffer[env_ids, 0]
+        # Sync prev_plan_buffer to the freshly committed plan so the very next
+        # planner_consistency reward computation sees zero diff. Without this,
+        # _commit_plan's internal snapshot captured the zero-initialized
+        # plan_buffer, and the diff against the first real commit produces a
+        # ~70 m² spike per env → ~-1700 reward at iter 0 (smoke 2026-06-29).
+        self.prev_plan_buffer[env_ids] = self.plan_buffer[env_ids].clone()
 
     def _calibrate_hip_offset(self, env_ids: torch.Tensor):
         """Measure body-frame foot offset (= effective hip_offset_b) at the
