@@ -123,3 +123,27 @@ when DTC-lite enters real training.
    training run.
 3. Then run a real 3000–10000 iter training and compare against the existing
    DTC baseline at the same iter count.
+
+## Post-fix retest (commit `e0409ec`)
+
+Applied the one-line `prev_plan_buffer` re-sync in `_resample_command` and
+re-ran the same 100-iter smoke (256 envs, wandb run
+`smoke_dtc_lite_256_post_fix`). Comparison vs. pre-fix run:
+
+| Scalar | iter 0 before → after | iter 99 before → after |
+|---|---|---|
+| `Train/mean_reward` | **-45737 → -6.2** | -7.0 → **-4.3** |
+| `Episode_Reward/planner_consistency` | -1747.8 → **-0.049** | -0.131 → **-0.001** |
+| `Episode_Reward/footstep_swing_tracking_log` | -0.023 → -0.023 | -0.005 → -0.001 |
+| `Episode_Termination/base_contact` | 2.75 → 2.75 | **126.75 → 28.5** |
+| `Curriculum/terrain_levels` | 3.40 → 3.40 | 0.00 → 0.00 (unchanged — followup #3) |
+
+**Unexpected finding:** the iter-0 spike was actively poisoning the value
+function, not just wasting compute. With the spike removed, end-of-run
+fall counts (`base_contact`) drop 4.4× even though the policy still hasn't
+learned anything useful. The corrupted value targets at iter 0 were
+propagating downstream and degrading exploration.
+
+This bumps the priority of the analogous follow-ups (K² memory rewrite,
+curriculum) — early signal quality matters more than the per-iter cost
+on these short runs.
