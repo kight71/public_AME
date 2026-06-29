@@ -128,6 +128,23 @@ class FootstepPlanCommand(CommandTerm):
 
         self.height_scanner: RayCaster = env.scene.sensors[cfg.height_scanner_name]
 
+        # ---- grid shape for fast foothold selection ---------------------
+        # Derive (H, W) and resolution from the scanner's pattern_cfg when it
+        # is a GridPatternCfg; otherwise fall back to None (brute-force path).
+        self._cost_grid_shape: tuple[int, int] | None = None
+        self._cost_grid_resolution: float | None = None
+        try:
+            from isaaclab.sensors.ray_caster.patterns.patterns_cfg import GridPatternCfg as _GridPatternCfg
+            pcfg = self.height_scanner.cfg.pattern_cfg
+            if isinstance(pcfg, _GridPatternCfg):
+                import math as _math
+                W = round(pcfg.size[0] / pcfg.resolution) + 1  # x-direction cells
+                H = round(pcfg.size[1] / pcfg.resolution) + 1  # y-direction cells
+                self._cost_grid_shape = (H, W)
+                self._cost_grid_resolution = pcfg.resolution
+        except Exception:
+            pass  # Any import/attribute error → keep None (brute-force fallback)
+
         # ---- hip offsets (body frame) -----------------------------------
         # Initial guess from cfg; will be overwritten on first _resample_command
         # using the robot's actual standing pose (foot pos relative to root,
@@ -449,6 +466,8 @@ class FootstepPlanCommand(CommandTerm):
                         gamma=self.cfg.cost_gamma,
                         delta=self.cfg.cost_delta,
                         obstacle_height_threshold=self.cfg.cost_obstacle_threshold,
+                        grid_shape=self._cost_grid_shape,
+                        grid_resolution=self._cost_grid_resolution,
                     )
                 else:
                     tgt = self._snap_z_via_nearest_ray(tgt, ray_hits_w)

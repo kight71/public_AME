@@ -10,10 +10,36 @@ Cost composition (per candidate cell c):
             + delta * ||xy_c - xy_raibert||^2 # stay-close-to-prior
 
 Selection: argmin over candidate cells within ``window_m`` of the Raibert center.
+
+Fast path (grid kwargs supplied)
+---------------------------------
+When ``grid_shape=(H, W)`` and ``grid_resolution`` are provided the function
+reshapes the flat K=H*W ray-hit tensor into a 2-D height grid and uses a pair
+of ``_F.max_pool2d`` passes (one for z_max, one for z_min via negation) to
+compute local roughness in O(B*H*W) memory.
+
+Memory comparison at B=4096, K=693 (H=21, W=33, resolution=0.05 m):
+  Brute-force: two (B, K, K, 2) tensors -> ~5.9 GB (OOM at 16 GB)
+  Grid path:   two (B, 1, H, W) tensors -> ~11 MB
+
+Ray-ordering note
+-----------------
+IsaacLab's ``grid_pattern`` with default ``ordering="xy"`` calls
+``torch.meshgrid(x, y, indexing="xy")``, which produces a grid of shape
+``(len(y), len(x)) = (H, W)``. After ``flatten()`` the scan order is
+row-major over ``(H, W)`` -- outer loop over y (rows), inner loop over x
+(columns). Therefore ``ray_hits_w[:, :, 2].reshape(B, H, W)`` is correct
+when ``grid_shape = (H, W) = (len(y_cells), len(x_cells))``.
+
+For ``size=[1.6, 1.0]``, ``resolution=0.05``:
+  x: 33 points -> W=33
+  y: 21 points -> H=21
+  K = H*W = 693
 """
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as _F
 
 __all__ = ["select_foothold_by_cost"]
 
@@ -28,6 +54,8 @@ def select_foothold_by_cost(
     gamma: float = 5.0,
     delta: float = 1.0,
     obstacle_height_threshold: float = 0.15,
+    grid_shape: tuple[int, int] | None = None,
+    grid_resolution: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pick the lowest-cost foothold in a square window around ``raibert_xy_w``.
 
@@ -38,6 +66,11 @@ def select_foothold_by_cost(
         window_m: half-side of the candidate window, metres.
         alpha, beta, gamma, delta: cost weights (see module docstring).
         obstacle_height_threshold: roughness above this triggers ``gamma``.
+        grid_shape: optional ``(H, W)`` tuple. When provided together with
+            ``grid_resolution``, enables the fast max_pool2d path.
+            K must equal H*W. H = len(y-cells), W = len(x-cells).
+        grid_resolution: cell size in metres (e.g. 0.05). Required when
+            ``grid_shape`` is provided.
 
     Returns:
         selected_xyz_w: ``(B, F, 3)`` chosen foothold (xy + grid z).
@@ -52,24 +85,44 @@ def select_foothold_by_cost(
     d2 = (diff * diff).sum(dim=-1)
     in_window = d2 <= (window_m * window_m)
 
-    # 2) Per-cell roughness via K-nearest neighbours of each cell itself.
-    # We approximate "neighborhood" by the same window radius: for each
-    # candidate cell, look at all OTHER cells within window_m of IT.
-    # (B, K, K) is feasible because K ≤ ~700 for the existing height scanner.
-    cell_diff = ray_hits_w[:, :, None, :2] - ray_hits_w[:, None, :, :2]
-    cell_d2 = (cell_diff * cell_diff).sum(dim=-1)
-    cell_nbr = cell_d2 <= (window_m * window_m)
-    z_all = ray_hits_w[..., 2]  # (B, K)
-    # Mask non-neighbours with +/- inf so they don't affect max/min.
-    z_neg = torch.where(cell_nbr, z_all.unsqueeze(1).expand(B, K, K),
-                        torch.full_like(z_all.unsqueeze(1).expand(B, K, K), -float("inf")))
-    z_pos = torch.where(cell_nbr, z_all.unsqueeze(1).expand(B, K, K),
-                        torch.full_like(z_all.unsqueeze(1).expand(B, K, K), float("inf")))
-    z_max = z_neg.max(dim=-1).values  # (B, K)
-    z_min = z_pos.min(dim=-1).values  # (B, K)
-    roughness = z_max - z_min  # (B, K)
-    slope = roughness  # 1-ring approximation: same as roughness here.
+    # 2) Per-cell roughness -- choose fast grid path or legacy brute-force path.
+    if grid_shape is not None and grid_resolution is not None:
+        # ---- Fast path: O(B*H*W) via max_pool2d --------------------------------
+        H, W = grid_shape
+        assert K == H * W, (
+            f"select_foothold_by_cost: grid_shape={grid_shape} implies K={H * W} "
+            f"but ray_hits_w has K={K}. Check grid_shape=(H,W) matches scanner."
+        )
+        # Reshape flat K into spatial grid (B, H, W).
+        # Ray ordering: outer loop y (rows=H), inner loop x (cols=W) -- matches
+        # IsaacLab grid_pattern with default ordering="xy".
+        z_grid = ray_hits_w[:, :, 2].reshape(B, H, W)
 
+        radius_cells = max(1, int(round(window_m / grid_resolution)))
+        ksize = 2 * radius_cells + 1  # pool kernel size
+        # padding=radius_cells gives same spatial size as input (with edge
+        # zero-padding; edges see a smaller effective neighbourhood which is
+        # equivalent to the brute-force "in_window" mask clipping at the grid edge).
+        z4 = z_grid.unsqueeze(1)  # (B, 1, H, W)
+        z_max = _F.max_pool2d(z4, kernel_size=ksize, stride=1, padding=radius_cells).squeeze(1)
+        z_min = -_F.max_pool2d(-z4, kernel_size=ksize, stride=1, padding=radius_cells).squeeze(1)
+        roughness = (z_max - z_min).reshape(B, K)  # (B, K)
+    else:
+        # ---- Legacy brute-force path: O(B*K^2) --------------------------------
+        # Kept for backward-compat when grid kwargs are absent.
+        cell_diff = ray_hits_w[:, :, None, :2] - ray_hits_w[:, None, :, :2]
+        cell_d2 = (cell_diff * cell_diff).sum(dim=-1)
+        cell_nbr = cell_d2 <= (window_m * window_m)
+        z_all = ray_hits_w[..., 2]  # (B, K)
+        z_neg = torch.where(cell_nbr, z_all.unsqueeze(1).expand(B, K, K),
+                            torch.full_like(z_all.unsqueeze(1).expand(B, K, K), -float("inf")))
+        z_pos = torch.where(cell_nbr, z_all.unsqueeze(1).expand(B, K, K),
+                            torch.full_like(z_all.unsqueeze(1).expand(B, K, K), float("inf")))
+        z_max = z_neg.max(dim=-1).values  # (B, K)
+        z_min = z_pos.min(dim=-1).values  # (B, K)
+        roughness = z_max - z_min  # (B, K)
+
+    slope = roughness  # 1-ring approximation: same as roughness here.
     obstacle_flag = (roughness > obstacle_height_threshold).float()
 
     # 3) Cost per (env, foot, cell). Broadcast scalar terms over F.
