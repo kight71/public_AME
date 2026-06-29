@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     ActorCriticRecurrent,
     ActorCriticEncoder,
     ActorCriticTerrainMlp,
+    ActorCriticDTC,
     resolve_rnd_config,
     resolve_symmetry_config,
 )
