@@ -222,8 +222,8 @@ def footstep_phase_info(env: ManagerBasedRLEnv, command_name: str = "footstep_pl
     """Body-agnostic phase metadata per planned step: (time_left, contact_target).
 
     Returns ``(B, N*2*2)`` flattened in order ``(k, foot, [time_left, contact])``.
-    Use alongside :func:`footstep_plan` (or :func:`footstep_plan_full`) to give
-    the policy the DTC "what / where / when" triplet for each future step.
+    Use alongside :func:`footstep_plan` to give the policy the DTC
+    "what / where / when" triplet for each future step.
     """
     cmd = env.command_manager.get_term(command_name)
     # (B, N, 2, 2)
