@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# venv
+.AME/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Project artifacts
+logs/
+outputs/
+wandb/
+experiment_keyframes/
+keyframes_elevation_compare/
+attention_weights.npy
+height_ablation_data_template.csv
+*.tfevents.*
+*.npy
+*.npz
+
+# Subagent / superpowers scratch
+.superpowers/
+.agents/
+
+# Nested repo with its own history (deploy_for_AME WIP scaffold); leave
+# untracked at the outer level. Task 12 of the DTC-lite plan will revisit
+# this with a proper submodule decision.
+deploy_for_AME/
+
+# Claude local
+.claude/
+.codex/
