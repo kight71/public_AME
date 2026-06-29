@@ -9,6 +9,7 @@ from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_encoder import ActorCriticEncoder
 from .actor_critic_terrain_mlp import ActorCriticTerrainMlp
+from .actor_critic_dtc import ActorCriticDTC
 from .rnd import *
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
@@ -19,6 +20,7 @@ __all__ = [
     "ActorCriticRecurrent",
     "ActorCriticEncoder",
     "ActorCriticTerrainMlp",
+    "ActorCriticDTC",
     "StudentTeacher",
     "StudentTeacherRecurrent",
 ]
