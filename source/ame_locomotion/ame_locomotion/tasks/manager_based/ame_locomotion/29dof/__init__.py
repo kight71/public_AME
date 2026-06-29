@@ -274,3 +274,25 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
     },
 )
+
+# DTC-lite: cost-based planner + pure-MLP policy.
+# See G1RoughEnvCfg_DTCLite docstring for the full design.
+gym.register(
+    id="AME-G1-29DOF-DTCLite-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTCLite",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1DTCLitePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-DTCLite-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTCLite_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1DTCLitePPORunnerCfg",
+    },
+)
