@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["raibert_target", "project_onto_elevation_map", "swing_trajectory"]
+__all__ = [
+    "raibert_target",
+    "project_onto_elevation_map",
+    "swing_trajectory",
+    "local_heightscan_around",
+]
 
 
 def _yaw_rotation(yaw: torch.Tensor) -> torch.Tensor:
@@ -157,3 +162,42 @@ def swing_trajectory(
     out = baseline.clone()
     out[..., 2] = out[..., 2] + z_bump
     return out
+
+
+def local_heightscan_around(
+    centers_w: torch.Tensor,
+    ray_hits_w: torch.Tensor,
+    *,
+    half_size_m: float = 0.10,
+    n_per_axis: int = 5,
+) -> torch.Tensor:
+    """Uniform n×n height samples around each center, relative to center.z.
+
+    For each (env, foot) center, builds an ``n_per_axis × n_per_axis`` grid
+    over a ``(2 * half_size_m)`` square in world xy, finds the closest ray-cast
+    cell to each sample point, and returns ``z_cell - center.z`` (so the patch
+    is height-of-terrain-relative-to-target). Shape: ``(B, F, n*n)``.
+
+    Designed to be cheap: the lookup is brute-force nearest neighbour over the
+    K (~700) scanner cells; with B≤4096, F=2, n=5 the inner product is fine.
+    """
+    B, F, _ = centers_w.shape
+    K = ray_hits_w.shape[1]
+    n = n_per_axis
+    device = centers_w.device
+
+    offs = torch.linspace(-half_size_m, half_size_m, n, device=device)
+    gx, gy = torch.meshgrid(offs, offs, indexing="xy")
+    grid = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)  # (n*n, 2)
+
+    # Sample world positions: center xy + grid offset.
+    sample_xy = centers_w[..., None, :2] + grid.view(1, 1, n * n, 2)  # (B, F, n*n, 2)
+
+    # Nearest-ray lookup per sample point.
+    diff = sample_xy[..., None, :] - ray_hits_w[:, None, None, :, :2]  # (B, F, n*n, K, 2)
+    d2 = (diff * diff).sum(dim=-1)  # (B, F, n*n, K)
+    nearest = d2.argmin(dim=-1)  # (B, F, n*n)
+    b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, F, n * n)
+    z_cell = ray_hits_w[b_idx, nearest, 2]  # (B, F, n*n)
+
+    return z_cell - centers_w[..., 2:3]  # relative to center.z

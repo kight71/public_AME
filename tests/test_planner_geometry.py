@@ -275,3 +275,34 @@ def test_swing_trajectory_endpoint_height_difference(planner):
     assert torch.allclose(
         planner.swing_trajectory(start, end, torch.ones(1, 1), apex=apex), end, atol=1e-6
     )
+
+
+# ----- local_heightscan_around ----------------------------------------------
+
+
+def test_local_heightscan_around_flat(planner):
+    # Flat ground at z=0, two centers, expect zeros relative to center.z=0.
+    centers = torch.tensor([[[0.5, 0.0, 0.0], [-0.5, 0.0, 0.0]]])
+    n = 31
+    xs = torch.linspace(-1.0, 1.0, n)
+    ys = torch.linspace(-1.0, 1.0, n)
+    gx, gy = torch.meshgrid(xs, ys, indexing="xy")
+    rays = torch.stack([gx, gy, torch.zeros_like(gx)], dim=-1).reshape(1, -1, 3)
+    out = planner.local_heightscan_around(centers, rays, half_size_m=0.10, n_per_axis=5)
+    assert out.shape == (1, 2, 25)
+    assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
+
+
+def test_local_heightscan_around_slope(planner):
+    # z = 0.1 * x, sample around (0, 0); expect non-zero per-cell deltas.
+    centers = torch.tensor([[[0.0, 0.0, 0.0]]])
+    n = 51
+    xs = torch.linspace(-0.5, 0.5, n)
+    ys = torch.linspace(-0.5, 0.5, n)
+    gx, gy = torch.meshgrid(xs, ys, indexing="xy")
+    z = 0.1 * gx
+    rays = torch.stack([gx, gy, z], dim=-1).reshape(1, -1, 3)
+    out = planner.local_heightscan_around(centers, rays, half_size_m=0.10, n_per_axis=5)
+    # Mean should be near zero (slope is anti-symmetric around x=0); range > 0.
+    assert out.abs().max().item() > 0.005
+    assert abs(out.mean().item()) < 1e-3
