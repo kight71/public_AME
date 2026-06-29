@@ -149,6 +149,10 @@ class FootstepPlanCommand(CommandTerm):
         self.target_w = torch.zeros(B, 2, 3, device=self.device)
         self.last_contact_w = torch.zeros(B, 2, 3, device=self.device)
         self.plan_buffer = torch.zeros(B, N, 2, 3, device=self.device)
+        self.prev_plan_buffer = torch.zeros(B, N, 2, 3, device=self.device)
+        self.time_left_buffer = torch.zeros(B, N, 2, device=self.device)
+        # Static between commits; (1 = on ground at landing time, 0 = airborne)
+        self.contact_target_buffer = torch.zeros(B, N, 2, device=self.device)
 
         # ---- phantom (virtual reference body) ---------------------------
         # Phantom is a virtual pelvis that advances by v_cmd every dt with a
@@ -313,6 +317,23 @@ class FootstepPlanCommand(CommandTerm):
         prev_phase = self.phase.clone()
         self.phase = (self.phase + dt / self.cfg.t_step) % 1.0
 
+        # time_left_in_phase(k, foot) = horizon(k, foot) - elapsed_in_stride.
+        # horizon mirrors _commit_plan's per-foot schedule:
+        #   swing foot: k*t_step + t_swing
+        #   other foot: (k+1)*t_step
+        N = self.cfg.n_future_steps
+        elapsed = self.phase * self.cfg.t_step  # (B,)
+        is_swing_left = (self.swing_foot == 0).float()  # (B,)
+        k_idx = torch.arange(N, device=self.device).view(1, N, 1).float()
+        # horizon for foot 0 (left)
+        h_swing = k_idx * self.cfg.t_step + self._t_swing
+        h_other = (k_idx + 1) * self.cfg.t_step
+        # left-foot horizon: h_swing if left is swing, else h_other
+        h_left = is_swing_left.view(-1, 1, 1) * h_swing + (1.0 - is_swing_left.view(-1, 1, 1)) * h_other
+        h_right = (1.0 - is_swing_left.view(-1, 1, 1)) * h_swing + is_swing_left.view(-1, 1, 1) * h_other
+        horizon = torch.cat([h_left, h_right], dim=-1)  # (B, N, 2)
+        self.time_left_buffer = (horizon - elapsed.view(-1, 1, 1)).clamp(min=0.0)
+
         # swing-foot crossover: phase crossed t_swing_fraction (left→right)
         # or wrapped back through 0 (right→left).
         crossed_half = (prev_phase < self.cfg.t_swing_fraction) & (
@@ -374,6 +395,9 @@ class FootstepPlanCommand(CommandTerm):
 
         ray_hits_w = self.height_scanner.data.ray_hits_w[env_ids]
 
+        # Snapshot previous plan for consistency reward.
+        self.prev_plan_buffer[env_ids] = self.plan_buffer[env_ids].clone()
+
         for k in range(N):
             for foot_idx in range(2):
                 is_swing = (swing_foot == foot_idx).float()  # (E,)
@@ -408,8 +432,25 @@ class FootstepPlanCommand(CommandTerm):
                     k_fb=self.cfg.raibert_k,
                     raibert_factor=self.cfg.raibert_factor,
                 )  # (E, 1, 3)
-                tgt = self._snap_z_via_nearest_ray(tgt, ray_hits_w)  # (E, 1, 3)
+                if self.cfg.use_cost_selection:
+                    from . import foothold_selection
+                    tgt, _ = foothold_selection.select_foothold_by_cost(
+                        raibert_xy_w=tgt,
+                        ray_hits_w=ray_hits_w,
+                        window_m=self.cfg.cost_window_m,
+                        alpha=self.cfg.cost_alpha,
+                        beta=self.cfg.cost_beta,
+                        gamma=self.cfg.cost_gamma,
+                        delta=self.cfg.cost_delta,
+                        obstacle_height_threshold=self.cfg.cost_obstacle_threshold,
+                    )
+                else:
+                    tgt = self._snap_z_via_nearest_ray(tgt, ray_hits_w)
                 self.plan_buffer[env_ids, k, foot_idx] = tgt[:, 0]
+                # contact_target: 1 (on ground at touchdown), but for swing foot
+                # at k=0 it's "still airborne now". For DTC observation purposes
+                # we use the *target* contact state at landing time = always 1.
+                self.contact_target_buffer[env_ids, k, foot_idx] = 1.0
 
     def _snap_z_via_nearest_ray(
         self, target_w: torch.Tensor, ray_hits_w: torch.Tensor
@@ -537,6 +578,34 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     its phantom appear sideways, implicitly penalizing yaw drift via foot
     target misalignment. Use B for visual validation of phantom mechanics
     against drifting policies; use A for training (stronger signal)."""
+
+    use_cost_selection: bool = False
+    """When True, replace the snap-to-nearest-ray z lookup with a full
+    cost-based foothold selection over a window around the Raibert prior.
+    See ``foothold_selection.select_foothold_by_cost`` for the cost function.
+
+    Default False — keeps the existing DTC env behavior bit-identical."""
+
+    cost_window_m: float = 0.10
+    """Half-side of the candidate window for cost-based selection, meters."""
+
+    cost_alpha: float = 2.0
+    """Cost weight on local roughness (max-min over window)."""
+
+    cost_beta: float = 1.0
+    """Cost weight on local slope (currently == roughness in the 1-ring approx)."""
+
+    cost_gamma: float = 5.0
+    """Cost weight on the obstacle flag (roughness > threshold)."""
+
+    cost_delta: float = 1.0
+    """Cost weight on distance to the Raibert prior (keeps planner close to
+    velocity-pushed nominal)."""
+
+    cost_obstacle_threshold: float = 0.15
+    """Roughness threshold (m) above which a cell is flagged as obstacle.
+    0.15 m corresponds to a typical stair tread height — anything higher than
+    that in a 10cm window is treated as an unstep-onable edge."""
 
     hip_y: float = 0.10
     """Hardcoded |y| hip offset in body frame (Phase 0 approximation)."""
