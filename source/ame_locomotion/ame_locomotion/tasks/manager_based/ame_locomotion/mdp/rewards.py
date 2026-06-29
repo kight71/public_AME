@@ -450,3 +450,72 @@ def footstep_contact_phase(
 
     match = 1.0 - (expected - actual).abs()                                    # (B, 2)
     return match[:, 0] * match[:, 1]                                            # (B,) AND
+
+
+def footstep_swing_tracking_log(
+    env: ManagerBasedRLEnv,
+    command_name: str = "footstep_plan",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+    force_threshold: float = 1.0,
+    eps: float = 1e-3,
+    apex: float = 0.10,
+) -> torch.Tensor:
+    """DTC-style log-distance reward for swing-foot tracking.
+
+    Equivalent to :func:`footstep_swing_tracking` but uses ``-log(d² + eps)``
+    instead of ``exp(-d²/std²)``. The log form gives a much steeper gradient
+    near the target than exp, which the DTC paper credits for fast convergence
+    on planner-tracking tasks. The gating (swing-only, airborne-only) is
+    unchanged.
+    """
+    from . import planner as planner_ops
+
+    cmd = env.command_manager.get_term(command_name)
+    foot_w = cmd.robot.data.body_pos_w[:, cmd.foot_ids]  # (B, 2, 3)
+    phase = cmd.phase
+    f = cmd.cfg.t_swing_fraction
+    one_minus_f = 1.0 - f
+
+    swing_phase_left = (phase / f).clamp(0.0, 1.0)
+    swing_phase_right = ((phase - f) / one_minus_f).clamp(0.0, 1.0)
+    swing_phase = torch.stack([swing_phase_left, swing_phase_right], dim=-1)
+
+    is_swing_left = (phase < f).float()
+    is_swing_right = (phase >= f).float()
+    is_swing = torch.stack([is_swing_left, is_swing_right], dim=-1)
+
+    ref = planner_ops.swing_trajectory(
+        start_w=cmd.last_contact_w,
+        end_w=cmd.target_w,
+        phase=swing_phase,
+        apex=apex,
+    )
+
+    d2 = ((foot_w - ref) ** 2).sum(dim=-1)  # (B, 2)
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w_history.norm(dim=-1)
+    foot_forces = forces.max(dim=1).values[:, sensor_cfg.body_ids]
+    is_airborne = (foot_forces <= force_threshold).float()
+
+    # -log(d² + eps): bounded above by -log(eps), goes to -inf as d→∞ (clamp).
+    log_term = -torch.log(d2 + eps)
+    # Subtract the at-target maximum so a perfect track yields 0, mistracks negative.
+    log_term = log_term - (-math.log(eps))
+    per_foot = log_term * is_swing * is_airborne
+    # Cap downside so a single bad foot can't dominate.
+    per_foot = per_foot.clamp(min=-10.0)
+    return per_foot.sum(dim=-1)
+
+
+def planner_consistency(env: ManagerBasedRLEnv, command_name: str = "footstep_plan") -> torch.Tensor:
+    """Squared distance between successive plan_buffers, summed over (k, foot).
+
+    Returns a positive value; assign a negative weight in the env config.
+    Used to discourage the cost-based planner from flip-flopping between
+    candidate footholds frame-over-frame — the DTC paper's "consistency"
+    cost weighted at 20.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    diff = cmd.plan_buffer - cmd.prev_plan_buffer  # (B, N, 2, 3)
+    return (diff ** 2).sum(dim=(1, 2, 3))
