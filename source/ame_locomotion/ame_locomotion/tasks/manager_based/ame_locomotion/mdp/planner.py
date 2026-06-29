@@ -178,8 +178,12 @@ def local_heightscan_around(
     cell to each sample point, and returns ``z_cell - center.z`` (so the patch
     is height-of-terrain-relative-to-target). Shape: ``(B, F, n*n)``.
 
-    Designed to be cheap: the lookup is brute-force nearest neighbour over the
-    K (~700) scanner cells; with B≤4096, F=2, n=5 the inner product is fine.
+    Memory note: lookup is brute-force nearest neighbour. The intermediate
+    distance tensor has shape ``(B, F, n*n, K, 2)`` so at training scale
+    (B=4096, F=2×N_future=4, n=5, K=700) the diff tensor alone is
+    ~287M float32 ≈ 1.1 GB, and ``d2`` adds another ~0.5 GB — peak ~1.6 GB
+    during ``argmin``. Acceptable on a 24 GB GPU; if VRAM is tight, batch
+    the call over chunks of envs or downsample ``K``.
     """
     B, F, _ = centers_w.shape
     K = ray_hits_w.shape[1]
