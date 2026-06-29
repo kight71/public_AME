@@ -825,6 +825,153 @@ class G1RoughEnvCfg_DTC_FORWARD(G1RoughEnvCfg_DTC):
 
 
 @configclass
+class G1RoughEnvCfg_DTCLite(G1RoughEnvCfg_Unitree):
+    """DTC-lite: cost-based foothold planner + pure-MLP policy (no AME/CNN+MHA).
+
+    Differences from ``G1RoughEnvCfg_DTC``:
+    - Planner uses cost-based foothold selection (Task 1) instead of nearest-z snap.
+    - Policy observations drop the global ``height_scan`` term and add three
+      planner-derived terms (foothold xyz, phase info, per-foothold local
+      heightscan). Critic keeps a global ``height_scan`` for privileged value
+      estimation.
+    - Reward terms swap exp-form swing tracking for log-form (weight 6) and add
+      ``planner_consistency`` (weight -20). ``track_lin_vel_xy_exp`` drops to 1.0
+      so foothold tracking is the dominant task signal.
+    - Runner cfg in the gym registration uses ``ActorCriticDTC`` (pure MLP).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # ---- Planner: enable cost-based selection -----------------------
+        self.commands.footstep_plan.use_cost_selection = True
+        self.commands.footstep_plan.cost_window_m = 0.10
+        self.commands.footstep_plan.cost_alpha = 2.0
+        self.commands.footstep_plan.cost_beta = 1.0
+        self.commands.footstep_plan.cost_gamma = 5.0
+        self.commands.footstep_plan.cost_delta = 1.0
+        self.commands.footstep_plan.cost_obstacle_threshold = 0.15
+        self.commands.footstep_plan.n_future_steps = 2
+        self.commands.footstep_plan.raibert_factor = 0.3
+        # No phantom: cost selection already filters out unreachable cells,
+        # and we want the policy to see real-robot foothold geometry.
+        self.commands.footstep_plan.use_phantom = False
+
+        # ---- Policy obs: drop global heightmap, add planner triplet -----
+        self.observations.policy.height_scan = None  # remove from policy
+        self.observations.policy.footstep_plan_xy = ObsTerm(
+            func=mdp.footstep_plan,
+            params={"command_name": "footstep_plan"},
+        )
+        self.observations.policy.footstep_phase_info = ObsTerm(
+            func=mdp.footstep_phase_info,
+            params={"command_name": "footstep_plan"},
+        )
+        self.observations.policy.footstep_local_heightscan = ObsTerm(
+            func=mdp.footstep_local_heightscan,
+            params={
+                "command_name": "footstep_plan",
+                "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "half_size_m": 0.10,
+                "n_per_axis": 5,
+            },
+        )
+        # Critic keeps global height_scan (privileged) plus the same planner terms.
+        self.observations.critic.footstep_plan_xy = ObsTerm(
+            func=mdp.footstep_plan,
+            params={"command_name": "footstep_plan"},
+        )
+        self.observations.critic.footstep_phase_info = ObsTerm(
+            func=mdp.footstep_phase_info,
+            params={"command_name": "footstep_plan"},
+        )
+        self.observations.critic.footstep_local_heightscan = ObsTerm(
+            func=mdp.footstep_local_heightscan,
+            params={
+                "command_name": "footstep_plan",
+                "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "half_size_m": 0.10,
+                "n_per_axis": 5,
+            },
+        )
+
+        # ---- Rewards: DTC paper defaults --------------------------------
+        # Foothold tracking is the dominant task signal.
+        self.rewards.footstep_swing_tracking.weight = 0.0  # legacy exp-form off
+        self.rewards.footstep_contact_phase.weight = 0.5    # soft companion
+        self.rewards.footstep_swing_tracking_log = RewTerm(
+            func=mdp.footstep_swing_tracking_log,
+            weight=6.0,
+            params={
+                "command_name": "footstep_plan",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+                "force_threshold": 1.0,
+                "eps": 1e-3,
+                "apex": 0.10,
+            },
+        )
+        # TODO(2026-06-29): DTC uses weight=20. Our cost selector should give
+        # more stable plans than TAMOLS, so this may over-suppress. Watch the
+        # planner_consistency channel in tensorboard — if it stays near 0 the
+        # whole run, this is fine; if the planner is locked even when terrain
+        # changes, drop to ~5.
+        self.rewards.planner_consistency = RewTerm(
+            func=mdp.planner_consistency,
+            weight=-20.0,
+            params={"command_name": "footstep_plan"},
+        )
+        # Drop velocity tracking weight so foothold is the primary objective.
+        self.rewards.track_lin_vel_xy_exp.weight = 1.0
+        # Keep yaw tracking strong (the planner has no yaw command of its own).
+        self.rewards.track_ang_vel_z_exp.weight = 2.0
+
+
+@configclass
+class G1RoughEnvCfg_DTCLite_PLAY(G1RoughEnvCfg_DTCLite):
+    """Play configuration for DTC-lite checkpoints, fixed forward command."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.episode_length_s = 40.0
+
+        self.scene.visualize_cam = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link/visualize_cam",
+            update_period=0.1, height=480, width=640, data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0, focus_distance=400.0,
+                horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5),
+            ),
+            offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 3.0), rot=(0.707, 0.0, 0.707, 0.0), convention="world"),
+        )
+
+        self.scene.terrain.max_init_terrain_level = None
+        if self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.num_rows = 1
+            self.scene.terrain.terrain_generator.num_cols = 1
+            self.scene.terrain.terrain_generator.curriculum = False
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
+            "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0),
+                               "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)},
+        }
+
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
 class G1RoughEnvCfg_PLAY(G1RoughEnvCfg):
     def __post_init__(self):
         # post init of parent
