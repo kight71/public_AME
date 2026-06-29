@@ -216,3 +216,48 @@ def footstep_plan(env: ManagerBasedRLEnv, command_name: str = "footstep_plan") -
     plan_w = cmd.plan_buffer  # (B, N, 2, 3)
     plan_b = _world_to_body_yaw(plan_w, cmd.robot)
     return plan_b.flatten(start_dim=1)
+
+
+def footstep_phase_info(env: ManagerBasedRLEnv, command_name: str = "footstep_plan") -> torch.Tensor:
+    """Body-agnostic phase metadata per planned step: (time_left, contact_target).
+
+    Returns ``(B, N*2*2)`` flattened in order ``(k, foot, [time_left, contact])``.
+    Use alongside :func:`footstep_plan` (or :func:`footstep_plan_full`) to give
+    the policy the DTC "what / where / when" triplet for each future step.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    # (B, N, 2, 2)
+    info = torch.stack([cmd.time_left_buffer, cmd.contact_target_buffer], dim=-1)
+    return info.flatten(start_dim=1)
+
+
+def footstep_local_heightscan(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "footstep_plan",
+    half_size_m: float = 0.10,
+    n_per_axis: int = 5,
+) -> torch.Tensor:
+    """Per-planned-foothold local height patches (relative-z), shape ``(B, N*2*n²)``.
+
+    For each (k, foot) in the planner's world-frame plan buffer, samples an
+    ``n_per_axis × n_per_axis`` height grid around the planned xy and returns
+    ``z_terrain - z_planned``. This is the sim/real-invariant terrain feature
+    the policy actually sees — small patches drawn from the same elevation
+    grid that ``grid_map_builder`` would provide on hardware.
+    """
+    from . import planner as planner_ops  # local import: keeps planner Isaac-Sim-free
+    cmd = env.command_manager.get_term(command_name)
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    ray_hits_w = sensor.data.ray_hits_w  # (B, K, 3)
+
+    plan_w = cmd.plan_buffer  # (B, N, 2, 3)
+    B, N, _, _ = plan_w.shape
+    centers = plan_w.reshape(B, N * 2, 3)
+    patches = planner_ops.local_heightscan_around(
+        centers_w=centers,
+        ray_hits_w=ray_hits_w,
+        half_size_m=half_size_m,
+        n_per_axis=n_per_axis,
+    )  # (B, N*2, n*n)
+    return patches.flatten(start_dim=1)

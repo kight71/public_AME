@@ -306,3 +306,16 @@ def test_local_heightscan_around_slope(planner):
     # Mean should be near zero (slope is anti-symmetric around x=0); range > 0.
     assert out.abs().max().item() > 0.005
     assert abs(out.mean().item()) < 1e-3
+
+
+def test_footstep_local_heightscan_signature(planner):
+    # Just verify shape arithmetic via the helper; full obs path is exercised
+    # at runtime in the smoke test (Task 10).
+    centers = torch.zeros(2, 4, 3)  # B=2, N*F=4
+    n_rays = 121
+    xs = torch.linspace(-1.0, 1.0, 11)
+    ys = torch.linspace(-1.0, 1.0, 11)
+    gx, gy = torch.meshgrid(xs, ys, indexing="xy")
+    rays = torch.stack([gx, gy, torch.zeros_like(gx)], dim=-1).reshape(1, n_rays, 3).expand(2, n_rays, 3)
+    out = planner.local_heightscan_around(centers, rays, half_size_m=0.10, n_per_axis=5)
+    assert out.shape == (2, 4, 25)
