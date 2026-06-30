@@ -377,7 +377,7 @@ def footstep_swing_tracking(
     reward = sum over feet of ``exp(-||foot_actual - foot_ref||² / std²) *
              is_swing_mask * is_airborne * vel_gate``  →  shape ``(B,)`` in ``[0, 2]``.
 
-    The ``vel_gate`` is a soft tanh² mask on the body-frame xy velocity
+    The ``vel_gate`` is a soft ``sech²`` mask on the body-frame xy velocity
     tracking error ``||v_root_xy - v_cmd_xy||`` (world frame, magnitude only).
     It removes the "marching-in-place" exploit where a non-translating robot
     can still collect ~40% of the swing-tracking reward by lifting and
@@ -389,14 +389,29 @@ def footstep_swing_tracking(
       * walking with the command → gate≈1 → full swing-tracking reward
         applies, refining the gait as before.
 
-    The gate is soft (tanh² of error / vel_gate_std) rather than a hard
-    threshold so the reward does not vanish abruptly during early random
-    exploration — a partial-commits gait still earns a reduced but
-    non-zero signal, and the gradient always points toward "more forward
-    velocity" before "more precise foot placement". Default
-    ``vel_gate_std=1.0`` keeps the gate ≥ 0.05 for tracking errors up to
-    ~0.6 m/s, matching the env's commanded-speed scale; tighten to ~0.5
-    once the base gait is reliable.
+    Math: ``gate = sech²(|v_err| / std) = 1 - tanh²(|v_err| / std)``, which
+    is the standard RBF-form membership function. Two properties that
+    distinguish it from ``1 - tanh(|x|)`` were the reason for this choice:
+
+      (1) **Zero gradient at the optimum.** ``sech²(x)`` has
+          ``d/dx sech²(0) = 0``, so once the robot's xy velocity matches the
+          command the velocity-gate stops contributing gradient and lets
+          ``swing_err`` (the foot-tracking error) own the gradient budget —
+          the policy can then refine the gait instead of being perpetually
+          yanked by the velocity term. ``1 - tanh(x)`` has -1 gradient at x=0,
+          which would compete with swing_err even at perfect tracking.
+      (2) **Softer transition.** At ``|v_err| = std``, ``sech²=0.42`` vs
+          ``1-tanh=0.24``. The wider shoulder keeps a partial-bonus signal
+          alive through "half-walking" states, so a partial-commits gait
+          earns a reduced but non-zero signal and the gradient always points
+          toward "more forward velocity" before "more precise foot
+          placement". This avoids the scaffold-too-narrow failure of
+          tightening ``std`` on the exponential directly (signal vanishes
+          outright for random early policies).
+
+    Default ``vel_gate_std=1.0`` keeps the gate ≥ 0.05 for tracking errors
+    up to ~0.6 m/s, matching the env's commanded-speed scale; tighten to
+    ~0.5 once the base gait is reliable.
 
     The other anti-slide cues (``footstep_contact_phase`` AND-product and
     ``feet_air_time`` requiring actual airborne phases) already block the
@@ -440,7 +455,7 @@ def footstep_swing_tracking(
         )
     is_airborne = (foot_forces <= force_threshold).float()
 
-    # Velocity-tracking gate: tanh² on world-frame xy speed error, applied
+    # Velocity-tracking gate: sech² on world-frame xy speed error, applied
     # identically to both feet (broadcast over F dim). This makes
     # marching-in-place (v≈0 while cmd≠0) unable to farm the swing-tracking
     # reward via in-place foot oscillation; only a body that translates with
@@ -456,7 +471,7 @@ def footstep_swing_tracking(
     v_root_xy = cmd.robot.data.root_lin_vel_w[:, :2]
     v_err = ((v_root_xy[:, 0] - v_cmd_w_x) ** 2
              + (v_root_xy[:, 1] - v_cmd_w_y) ** 2)
-    vel_gate = torch.tanh(torch.sqrt(v_err + 1e-6) / vel_gate_std) ** 2
+    vel_gate = 1.0 - torch.tanh(torch.sqrt(v_err + 1e-6) / vel_gate_std) ** 2
 
     per_foot = torch.exp(-err2 / (std * std)) * is_swing * is_airborne
     per_foot = per_foot * vel_gate.unsqueeze(-1)
