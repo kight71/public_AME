@@ -362,6 +362,8 @@ def footstep_swing_tracking(
     force_threshold: float = 1.0,
     std: float = 0.08,
     apex: float = 0.10,
+    vel_gate_std: float = 1.0,
+    vel_gate_command_name: str = "base_velocity",
 ) -> torch.Tensor:
     """Per-step dense reward for tracking the desired swing-foot trajectory.
 
@@ -373,7 +375,33 @@ def footstep_swing_tracking(
     with `feet_slide`.
 
     reward = sum over feet of ``exp(-||foot_actual - foot_ref||² / std²) *
-             is_swing_mask * is_airborne``  →  shape ``(B,)`` in ``[0, 2]``.
+             is_swing_mask * is_airborne * vel_gate``  →  shape ``(B,)`` in ``[0, 2]``.
+
+    The ``vel_gate`` is a soft tanh² mask on the body-frame xy velocity
+    tracking error ``||v_root_xy - v_cmd_xy||`` (world frame, magnitude only).
+    It removes the "marching-in-place" exploit where a non-translating robot
+    can still collect ~40% of the swing-tracking reward by lifting and
+    setting the foot down near the current root position. With the gate:
+
+      * standing still (|v|≈0 while cmd≠0) → gate≈0 → swing_tracking≈0,
+        so the only forward signal left is `track_lin_vel_xy_exp`, which is
+        what we want (break the saddle).
+      * walking with the command → gate≈1 → full swing-tracking reward
+        applies, refining the gait as before.
+
+    The gate is soft (tanh² of error / vel_gate_std) rather than a hard
+    threshold so the reward does not vanish abruptly during early random
+    exploration — a partial-commits gait still earns a reduced but
+    non-zero signal, and the gradient always points toward "more forward
+    velocity" before "more precise foot placement". Default
+    ``vel_gate_std=1.0`` keeps the gate ≥ 0.05 for tracking errors up to
+    ~0.6 m/s, matching the env's commanded-speed scale; tighten to ~0.5
+    once the base gait is reliable.
+
+    The other anti-slide cues (``footstep_contact_phase`` AND-product and
+    ``feet_air_time`` requiring actual airborne phases) already block the
+    "slide both feet forward while connected to ground" failure mode, so
+    we do not gate on z-height or air time here.
     """
     from . import planner as planner_ops  # local import: keeps planner Isaac-Sim-free
 
@@ -412,7 +440,26 @@ def footstep_swing_tracking(
         )
     is_airborne = (foot_forces <= force_threshold).float()
 
+    # Velocity-tracking gate: tanh² on world-frame xy speed error, applied
+    # identically to both feet (broadcast over F dim). This makes
+    # marching-in-place (v≈0 while cmd≠0) unable to farm the swing-tracking
+    # reward via in-place foot oscillation; only a body that translates with
+    # its commanded speed unlocks the bonus. Using world-frame |v| avoids
+    # sign-cancellation when the robot walks at the commanded speed in any
+    # direction.
+    v_cmd_b = env.command_manager.get_command(vel_gate_command_name)[:, :3]
+    root_yaw = cmd.robot.data.heading_w
+    c = torch.cos(root_yaw)
+    s = torch.sin(root_yaw)
+    v_cmd_w_x = c * v_cmd_b[:, 0] - s * v_cmd_b[:, 1]
+    v_cmd_w_y = s * v_cmd_b[:, 0] + c * v_cmd_b[:, 1]
+    v_root_xy = cmd.robot.data.root_lin_vel_w[:, :2]
+    v_err = ((v_root_xy[:, 0] - v_cmd_w_x) ** 2
+             + (v_root_xy[:, 1] - v_cmd_w_y) ** 2)
+    vel_gate = torch.tanh(torch.sqrt(v_err + 1e-6) / vel_gate_std) ** 2
+
     per_foot = torch.exp(-err2 / (std * std)) * is_swing * is_airborne
+    per_foot = per_foot * vel_gate.unsqueeze(-1)
     return per_foot.sum(dim=-1)
 
 
