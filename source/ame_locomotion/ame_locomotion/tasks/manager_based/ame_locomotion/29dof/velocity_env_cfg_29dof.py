@@ -1606,7 +1606,8 @@ class G1UrdfHeightMlpEnvCfg_PLAY(G1HeightMlpEnvCfg_PLAY):
 #
 # Configuration follows BeamDojo paper Table VII (Appendix VI-A):
 #   - dense locomotion group + sparse foothold penalty (weight -1.0)
-#   - no Unitree alive/foot_clearance extras; no model-based planner
+#   - no Unitree foot_clearance extra; no model-based planner
+#   - alive (+0.15) + termination_penalty (-200) kept for early stability
 # Double critic and two-stage soft/hard terrain remain follow-ups.
 # =========================================================================
 
@@ -1696,8 +1697,11 @@ class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
             params={**_BEAMDOJO_FOOTHOLD_PARAMS, "height_epsilon": -0.1},
         )
 
+        # --- Early stability (complements paper rewards; reduces face-plant churn) ---
+        r.termination_penalty.weight = -200.0
+        r.alive = RewTerm(func=mdp.is_alive, weight=0.15)
+
         # --- Disable non-paper / legacy terms ---
-        r.termination_penalty.weight = 0.0
         r.undesired_contacts.weight = 0.0
         r.dof_torques_l2.weight = 0.0
         r.dof_torques_limits.weight = 0.0
