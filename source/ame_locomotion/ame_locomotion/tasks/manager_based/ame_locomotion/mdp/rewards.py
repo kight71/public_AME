@@ -581,3 +581,175 @@ def planner_consistency(env: ManagerBasedRLEnv, command_name: str = "footstep_pl
     cmd = env.command_manager.get_term(command_name)
     diff = cmd.plan_buffer - cmd.prev_plan_buffer  # (B, N, 2, 3)
     return (diff ** 2).sum(dim=(1, 2, 3))
+
+
+# =========================================================================
+# BeamDojo-style rewards (Wang et al. 2025, arXiv:2502.10363).
+#
+# Design (per BeamDojo paper, "sampling-based foothold reward for polygonal
+# feet"): when a foot is in stance, sample N points on the rectangular
+# outline of the sole and check each against the height scanner's ray hits.
+# A sample is "supported" if the ray hit nearest in xy is within
+# `support_threshold` of the actual foot sole z. The per-step reward is the
+# fraction of supported samples; sparse reward − only fires when the foot
+# is actually in contact (no reward for flying feet).
+#
+# This is feedback-style: evaluates actual foot placement quality rather
+# than asking the policy to track a planner-supplied target. We use a
+# rectangular sampling grid. The sole offset comes from Unitree G1
+# ankle_roll_link STL bounds:
+#   /home/tan/unitree_mujoco/unitree_robots/g1/meshes/*_ankle_roll_link.STL
+#   bounds min_z = -0.035409145 m, x extent = 0.2082 m, y extent = 0.0756 m.
+# =========================================================================
+
+
+G1_ANKLE_ROLL_MESH_MIN_Z = -0.035409145057201385
+
+
+def foothold_sampling(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg(
+        "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+    ),
+    height_scanner_name: str = "height_scanner",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+    ),
+    foot_length: float = 0.18,
+    foot_width: float = 0.065,
+    n_long: int = 4,
+    n_lat: int = 3,
+    support_threshold: float = 0.03,
+    force_threshold: float = 1.0,
+    sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
+) -> torch.Tensor:
+    """BeamDojo-style sampling-based foothold support reward.
+
+    Per stance foot, samples ``n_long * n_lat`` points on a rectangular
+    grid (foot_length x foot_width, body frame, centered on the ankle_roll
+    link origin in xy). For each sample, the height scanner's nearest ray hit (in
+    xy) gives a terrain z; the sample counts as "supported" if
+    ``|terrain_z - foot_sole_z| <= support_threshold``. The reward is
+    the per-foot support fraction averaged over the two feet, masked to
+    fire only when the foot is actually in contact.
+
+    ``sole_z_offset`` is the link-frame min-z of the foot mesh, so the z
+    comparison uses the sole plane rather than the ankle link origin. Shape
+    ``(B,)`` in ``[0, 1]``.
+    """
+    from isaaclab.sensors import RayCaster
+
+    foot_body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+    # Resolve foot ids explicitly in each component's own index space. Do not
+    # rely on SceneEntityCfg.body_ids here: the robot articulation and contact
+    # sensor can resolve the same body-name expression differently, and older
+    # configs used a broad regex that matched four ankle-related bodies.
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_body_ids, resolved_asset_names = asset.find_bodies(foot_body_names, preserve_order=True)
+    foot_pos_w = asset.data.body_pos_w[:, foot_body_ids]  # (B, F, 3)
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    sensor_body_ids, resolved_sensor_names = contact_sensor.find_bodies(foot_body_names, preserve_order=True)
+
+    # one-time debug: print resolved body names + shapes (BeamDojo smoke 2026-07-01)
+    if not getattr(env, "_foothold_dbg_printed", False):
+        print(
+            "[foothold_sampling DBG] "
+            f"asset_ids={foot_body_ids} asset_names={resolved_asset_names} "
+            f"sensor_ids={sensor_body_ids} sensor_names={resolved_sensor_names} "
+            f"foot_pos_w.shape={tuple(foot_pos_w.shape)}"
+        )
+        env._foothold_dbg_printed = True
+    if foot_pos_w.shape[1] != 2:
+        raise RuntimeError(
+            f"foothold_sampling expects exactly two foot bodies; got "
+            f"foot_body_ids={foot_body_ids} (n={foot_pos_w.shape[1]}). "
+            f"Resolved asset names: {resolved_asset_names}. "
+            f"it must resolve to only left_ankle_roll_link and right_ankle_roll_link."
+        )
+    if len(sensor_body_ids) != 2:
+        raise RuntimeError(
+            "foothold_sampling expects the contact sensor to resolve exactly two foot bodies; "
+            f"got sensor_body_ids={sensor_body_ids}, names={resolved_sensor_names}."
+        )
+
+    # Foot orientation (yaw only) — we project the body-frame rectangular
+    # sampling grid into world frame. ankle_roll_link orientation is ~root
+    # yaw for a standing gait, which is the close-enough approximation used
+    # by BeamDojo’s foot-frame sampling.
+    foot_rot_w = asset.data.body_quat_w[:, foot_body_ids]  # (B, 2, 4), (w, x, y, z)
+    # Extract yaw angle directly from quaternion (z-axis rotation only).
+    qw = foot_rot_w[..., 0]
+    qx = foot_rot_w[..., 1]
+    qy = foot_rot_w[..., 2]
+    qz = foot_rot_w[..., 3]
+    yaw = torch.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))  # (B, 2)
+    c = torch.cos(yaw)  # (B, 2)
+    s = torch.sin(yaw)  # (B, 2)
+    # Each row-vector foot-frame offset (x, y) is rotated by this 2x2.
+
+    # Build the per-foot body-frame sampling grid (n_long x n_lat).
+    device = foot_pos_w.device
+    xs = torch.linspace(-foot_length * 0.5, foot_length * 0.5, n_long, device=device)
+    ys = torch.linspace(-foot_width * 0.5, foot_width * 0.5, n_lat, device=device)
+    gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+    grid_b = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)  # (N, 2)
+    N = grid_b.shape[0]
+
+    # Rotate grid_b by per-foot yaw and translate to foot xy.
+    # grid_w: (B, 2, N, 2)
+    grid_b_exp = grid_b.view(1, 1, N, 2)  # broadcast to (B, 2, N, 2)
+    rot_c = c.unsqueeze(-1)  # (B, 2, 1)
+    rot_s = s.unsqueeze(-1)
+    x_w = rot_c * grid_b_exp[..., 0] - rot_s * grid_b_exp[..., 1]  # (B, 2, N)
+    y_w = rot_s * grid_b_exp[..., 0] + rot_c * grid_b_exp[..., 1]
+    sample_xy = torch.stack([x_w, y_w], dim=-1) + foot_pos_w[..., :2].unsqueeze(2)
+    # sample_xy: (B, 2, N, 2)
+
+    # Nearest-ray lookup for each sample against the height scanner ray hits.
+    height_scanner: RayCaster = env.scene.sensors[height_scanner_name]
+    ray_hits_w = height_scanner.data.ray_hits_w  # (B, K, 3)
+    K = ray_hits_w.shape[1]
+
+    diff = sample_xy[..., None, :] - ray_hits_w[:, None, None, :, :2]  # (B, 2, N, K, 2)
+    d2 = (diff * diff).sum(dim=-1)  # (B, 2, N, K)
+    nearest = d2.argmin(dim=-1)  # (B, 2, N)
+    b_idx = torch.arange(sample_xy.shape[0], device=device).view(-1, 1, 1).expand(-1, 2, N)
+    terrain_z = ray_hits_w[b_idx, nearest, 2]  # (B, 2, N)
+
+    foot_sole_z = foot_pos_w[..., 2:3] + sole_z_offset  # (B, 2, 1)
+    supported = ((terrain_z - foot_sole_z).abs() <= support_threshold).float()  # (B, 2, N)
+    support_frac = supported.mean(dim=-1)  # (B, 2)
+
+    # Contact mask: only stance feet actually receive the reward.
+    # ContactSensorData.net_forces_w_history shape is (env, history, body, xyz).
+    # Select foot bodies before reducing so the output is unambiguously (B, 2).
+    foot_force_hist = contact_sensor.data.net_forces_w_history[:, :, sensor_body_ids, :]  # (B, T, 2, 3)
+    foot_forces = foot_force_hist.norm(dim=-1).amax(dim=1)  # (B, 2)
+    if foot_forces.ndim != 2 or foot_forces.shape[1] != 2:
+        raise RuntimeError(
+            "foothold_sampling expects contact forces with shape (num_envs, 2); "
+            f"got {tuple(foot_forces.shape)}."
+        )
+    in_contact = (foot_forces > force_threshold).float()  # (B, 2)
+    per_foot = support_frac * in_contact  # (B, 2)
+    if not getattr(env, "_foothold_geom_dbg_printed", False):
+        ankle_gap = terrain_z - foot_pos_w[..., 2:3]
+        sole_gap = terrain_z - foot_sole_z
+        print(
+            "[foothold_sampling GEOM] "
+            f"sole_z_offset={sole_z_offset:.6f} "
+            f"ankle_gap_mean={ankle_gap.mean().item():.4f} "
+            f"sole_gap_mean={sole_gap.mean().item():.4f} "
+            f"support_frac_mean={support_frac.mean().item():.4f} "
+            f"contact_ratio={in_contact.mean().item():.4f}"
+        )
+        env._foothold_geom_dbg_printed = True
+    # Mean over both feet (denominator 2 matches BeamDojo: foot quality is averaged
+    # regardless of which foot is stance, so a single-stance configuration gets
+    # half the per-step reward and a double-stance configuration gets full).
+    reward = per_foot.mean(dim=1)  # (B,)
+    if reward.ndim != 1:
+        reward = reward.reshape(reward.shape[0], -1).mean(dim=1)
+    return reward

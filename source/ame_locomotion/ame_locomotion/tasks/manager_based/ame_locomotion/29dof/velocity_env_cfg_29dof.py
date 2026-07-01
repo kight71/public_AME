@@ -114,12 +114,28 @@ class CommandsCfg:
 
     # Phase 0 footstep planner — output is observed by the policy but does
     # NOT yet drive any reward term (see PLAN.md).
-    # raibert_factor=0.0: the planner mirrors the pretrained AME policy's
-    # natural "marching" gait (foot lands directly under hip). We start here
-    # to verify the planner-as-teacher hypothesis (does forcing the policy
-    # toward this signal speed up training?) before trying more aggressive
-    # Raibert factors (0.3 or 0.5) that would push the policy toward
-    # dynamic push-off.
+    #
+    # IMPORTANT: raibert_factor=0.0 does NOT decouple the target from v_cmd.
+    # The foothold XY is always forward-extrapolated by the commanded velocity
+    # in `_commit_plan` (commands.py: `root_pos_kf += horizon * vel_w_xy_mid`),
+    # i.e. the predicted landing hip is already moving at v_cmd. `raibert_factor`
+    # only adds an *extra* push beyond that predicted hip:
+    #
+    #     target = predicted_hip(t_touchdown) + R(yaw)·hip_offset
+    #              + raibert_factor · t_swing · v_cmd_w
+    #
+    #   factor=0  -> foot lands at predicted hip's foot-frame origin (directly
+    #                under hip; stable "marching" gait, no active push-off)
+    #   factor=0.5 -> foot lands ahead of hip by half a swing's worth of v_cmd
+    #                (classic Raibert, produces push-off / braking couples)
+    #
+    # So factor=0 still keeps the plan chasing the velocity command; it just
+    # stops the planner from *adding* push-off cues on top. We start at 0 to
+    # isolate "does forcing the policy toward this signal speed up training?"
+    # (see PLAN.md) before layering more aggressive Raibert factors (0.3 / 0.5)
+    # that would push the policy toward dynamic push-off. If you raise it, you
+    # are increasing the fore-aft foot displacement relative to hip, NOT
+    # enabling velocity coupling.
     footstep_plan = mdp.FootstepPlanCommandCfg(
         asset_name="robot",
         foot_body_names=("left_ankle_roll_link", "right_ankle_roll_link"),
@@ -162,14 +178,13 @@ class ObservationsCfg:
             params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": True},
         )
         # NOTE (Phase 0): footstep_plan command is computed and visualized but
-        # NOT added to policy observations — adding a new obs term would change
-        # the actor input shape and break loading `pretrained/ame1.pt`. The
-        # observation function lives in `mdp.footstep_plan`; switch it on here
-        # at Phase 1 (reward redesign) when we are ready to retrain from scratch.
-        # footstep_plan = ObsTerm(
-        #     func=mdp.footstep_plan,
-        #     params={"command_name": "footstep_plan"},
-        # )
+        # NOT added to policy observations here — adding a new obs term would
+        # change the actor input shape and break loading `pretrained/ame1.pt`.
+        # The planner observation triplet (footstep_plan_xy +
+        # footstep_phase_info + footstep_local_heightscan) is wired in
+        # `_FootstepPolicyCfg` / `_FootstepCriticCfg` (see G1RoughEnvCfg_Footstep
+        # below), where they are inserted BEFORE height_scan so the AME encoder's
+        # tail-slice (obs[:, -L*W*coord_dim:]) still picks up the terrain map.
 
         def __post_init__(self):
             self.enable_corruption = True   # Enable observation noise (default False)
@@ -618,22 +633,135 @@ class G1RoughEnvCfg(ManagerBasedRLEnvCfg):
 
 
 @configclass
-class G1RoughEnvCfg_Footstep(G1RoughEnvCfg):
-    """Treatment env for the Phase 1 footstep-reward experiment.
+class _FootstepPolicyCfg(ObsGroup):
+    """Policy observation group for the Phase 1 footstep experiment.
 
-    Identical to ``G1RoughEnvCfg`` except the two footstep-reward terms are
-    turned on. Use this for the A/B comparison vs. the baseline:
+    Same proprioceptive terms as ``ObservationsCfg.PolicyCfg`` but with the
+    planner observation triplet (footstep_plan_xy + footstep_phase_info +
+    footstep_local_heightscan) inserted BETWEEN proprio and height_scan.
+
+    Why the reordering: ``ActorCriticEncoder._encode_terrain`` (see
+    ``rsl_rl/rsl_rl/modules/actor_critic_encoder.py:161``) slices the
+    terrain map from the TAIL of the observation
+    (``obs[:, -L*W*coord_dim:]``). Appending the planner terms after
+    ``height_scan`` (the default ``ObservationGroupCfg`` behavior) would
+    push the map off the tail and corrupt the AME encoder's CNN input.
+
+    Noise: all proprio terms run noise-free. This mirrors the Stage-1
+    regime in ``G1RoughEnvCfg.__post_init__`` (the FINETUNE=False branch
+    clears every noise param on the policy group), since the Footstep arm
+    retrains from scratch on Stage-1 rough terrain.
+    """
+
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
+    projected_gravity = ObsTerm(func=mdp.projected_gravity)
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+    actions = ObsTerm(func=mdp.last_action)
+    # ---- planner observation triplet (body-frame, dense) ----
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_local_heightscan = ObsTerm(
+        func=mdp.footstep_local_heightscan,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "half_size_m": 0.10,
+            "n_per_axis": 5,
+        },
+    )
+    # ---- terrain map (MUST stay last for AME encoder tail-slice) ----
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True
+        self.concatenate_terms = True
+
+
+@configclass
+class _FootstepCriticCfg(ObsGroup):
+    """Critic observation group for the Phase 1 footstep experiment.
+
+    Mirrors ``_FootstepPolicyCfg`` but adds the privileged ``base_lin_vel``
+    term (matching the base ``CriticCfg``), keeps all terms noise-free
+    (critic obs is privileged), and keeps ``height_scan`` last for the AME
+    encoder tail-slice.
+    """
+
+    base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
+    projected_gravity = ObsTerm(func=mdp.projected_gravity)
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_local_heightscan = ObsTerm(
+        func=mdp.footstep_local_heightscan,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "half_size_m": 0.10,
+            "n_per_axis": 5,
+        },
+    )
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
+    )
+
+
+@configclass
+class G1RoughEnvCfg_Footstep(G1RoughEnvCfg):
+    """Phase 1 footstep experiment — planner BOTH observed AND rewarded.
+
+    Differs from ``G1RoughEnvCfg`` in two ways:
+
+    1. **Observations** — ``policy``/``critic`` are replaced with
+       ``_FootstepPolicyCfg`` / ``_FootstepCriticCfg`` so the policy now
+       sees the planner's "what / where / when" triplet (footstep_plan_xy,
+       footstep_phase_info, footstep_local_heightscan). This breaks loading
+       ``pretrained/ame1.pt`` (input shape changed) — the Footstep arm
+       retrains from scratch. Note: ``raibert_factor=0.0`` is kept (target
+       still forwards-extrapolates with v_cmd in ``_commit_plan``; factor
+       only adds *extra* push-off beyond the predicted hip — see the
+       comment on ``CommandsCfg.footstep_plan``).
+
+    2. **Rewards** — ``footstep_swing_tracking`` (exp-form, vel-gated) and
+       ``footstep_contact_phase`` are enabled with the same weights as the
+       previous Footstep config, so this is a clean continuation of the
+       A/B vs. ``AME-G1-29DOF-v0``:
 
         train.py --task AME-G1-29DOF-v0          --max_iterations 2000  (A)
         train.py --task AME-G1-29DOF-Footstep-v0 --max_iterations 2000  (B)
-
-    Default policy observations and 21 baseline reward terms are unchanged,
-    so ``pretrained/ame1.pt`` is loadable (warm-start) but **for a clean
-    sample-efficiency comparison train both arms from scratch**.
     """
 
     def __post_init__(self):
         super().__post_init__()
+        # Swap in obs groups with the planner triplet inserted before
+        # height_scan (see comment on _FootstepPolicyCfg). Done AFTER
+        # super().__post_init__() so the base's Stage-1 noise-clearing on
+        # the original groups does not collide.
+        self.observations.policy = _FootstepPolicyCfg()
+        self.observations.critic = _FootstepCriticCfg()
+        # Phase 1 footstep reward weights (unchanged vs previous config).
         self.rewards.footstep_swing_tracking.weight = 1.0
         self.rewards.footstep_contact_phase.weight = 0.5
 
@@ -1462,3 +1590,176 @@ class G1UrdfHeightMlpEnvCfg_PLAY(G1HeightMlpEnvCfg_PLAY):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = ROBOT_URDF_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+# =========================================================================
+# BeamDojo env (Wang et al. 2025, arXiv:2502.10363, RSS 2025).
+#
+# Core deviation from the DTC / Footstep line: there is NO model-based
+# footstep planner. The policy chooses footholds itself; the environment
+# evaluates actual foot placement quality per stance step via a
+# sampling-based foothold reward (see mdp.rewards.foothold_sampling).
+# Does NOT use the Raibert / LIP target / phantom / vel_gate apparatus
+# assembled in the Footstep arm — those were the source of the
+# swing-tracking-vs-velocity-tracking saddle we kept hitting. BeamDojo
+# sidesteps that conflict by removing the reference target entirely.
+#
+# Configuration choices follow the BeamDojo paper:
+#   - drop the footstep_plan command entirely (planner is gone)
+#   - keep base velocity tracking as the dominant dense reward
+#   - add `foothold_sampling` (weight 6.0, paper default) as a "sparse"
+#     foothold-quality signal — only fires for feet actually in contact
+#   - Unitree-shaped base rewards (alive + foot_clearance + softer yaw/arms
+#     weights) to keep early random-policy exploration alive long enough for
+#     the sparse foothold reward to matter.
+#   - Stock stage-1 observation layout (no planner triplet), so the AME
+#     encoder / ActorCriticEncoder keeps its expected input shape and
+#     `pretrained/ame1.pt` could in principle warm-start (we don't here)
+#   - Reward weights otherwise inherited from `G1RoughEnvCfg_Unitree`; the
+#     dense gait shaping terms coexist cleanly with the sparse foothold term
+#     (BeamDojo's `double critic` separates dense vs sparse at PPO level,
+#     not at env reward level — that remains a follow-up once the single-
+#     critic signal is healthy).
+# =========================================================================
+
+
+@configclass
+class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg_Unitree):
+    """BeamDojo env: no planner, sampling-based foothold reward.
+
+    Stage-1 first cut (this class): env-side scaffold.
+      - No `footstep_plan` command (planner fully removed).
+      - Add `foothold_sampling` reward (BeamDojo paper default weight=6.0).
+      - Inherit Unitree-style dense shaping (alive + foot_clearance) so early
+        exploration is not dominated by termination penalties.
+    The sparse-vs-dense critic separation (BeamDojo "double critic") is
+    a network concern and is intentionally not wired until the single-critic
+    BeamDojo reward has useful non-zero signal over a longer smoke run.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Remove the model-based footstep planner entirely. BeamDojo is a
+        # model-free foothold policy — the policy decides where to step,
+        # and the environment scores the actual landing quality.
+        self.commands.footstep_plan = None
+        # BeamDojo sampling-based foothold reward (sparse, only fires for
+        # stance feet). Weight follows the paper default; tuned later.
+        self.rewards.foothold_sampling = RewTerm(
+            func=mdp.foothold_sampling,
+            weight=6.0,
+            params={
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+                ),
+                "height_scanner_name": "height_scanner",
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+                ),
+                "foot_length": 0.18,
+                "foot_width": 0.065,
+                "n_long": 4,
+                "n_lat": 3,
+                "support_threshold": 0.03,
+                "force_threshold": 1.0,
+                "sole_z_offset": -0.035409145057201385,
+            },
+        )
+        # `feet_slide` and friends stay (gait shaping, all dense). Planner-
+        # specific rewards (`footstep_swing_tracking`,
+        # `footstep_contact_phase`) are already weight=0 in the base cfg
+        # but ensuring they don't apply anyway:
+        self.rewards.footstep_swing_tracking.weight = 0.0
+        self.rewards.footstep_contact_phase.weight = 0.0
+
+
+@configclass
+class G1RoughEnvCfg_BeamDojo_SMOKE(G1RoughEnvCfg_BeamDojo):
+    """Low-memory BeamDojo config for random-agent and short smoke tests.
+
+    Isaac/PhysX allocates several GPU contact-pair buffers up front. The
+    training cfg keeps generous buffers, but smoke tests only need a tiny
+    scene to verify env construction and reward shapes.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 1
+        self.scene.env_spacing = 2.5
+        self.episode_length_s = 10.0
+
+        # Keep the smoke terrain small so PhysX does not preallocate contact
+        # buffers sized for a full curriculum field.
+        self.scene.terrain.max_init_terrain_level = None
+        if self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.num_rows = 1
+            self.scene.terrain.terrain_generator.num_cols = 1
+            self.scene.terrain.terrain_generator.curriculum = False
+            self.scene.terrain.terrain_generator.size = (4.0, 4.0)
+
+        # Low-memory PhysX GPU buffers for smoke only. These are intentionally
+        # below the training defaults; use AME-G1-29DOF-BeamDojo-v0 for real
+        # training runs.
+        self.sim.physx.gpu_max_rigid_contact_count = 2**20
+        self.sim.physx.gpu_max_rigid_patch_count = 2**14
+        self.sim.physx.gpu_found_lost_pairs_capacity = 2**18
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2**21
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**18
+        self.sim.physx.gpu_collision_stack_size = 2**23
+        self.sim.physx.gpu_heap_capacity = 2**23
+        self.sim.physx.gpu_temp_buffer_capacity = 2**22
+
+
+@configclass
+class G1RoughEnvCfg_BeamDojo_PLAY(G1RoughEnvCfg_BeamDojo):
+    """Play configuration for BeamDojo checkpoints (forward-only)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.episode_length_s = 40.0
+
+        self.scene.visualize_cam = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link/visualize_cam",
+            update_period=0.1,
+            height=480,
+            width=640,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5)
+            ),
+            offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 3.), rot=(0.707, 0.0, 0.707, 0.0), convention="world"),
+        )
+
+        self.scene.terrain.max_init_terrain_level = None
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (-0.0, 0.0), "y": (-0.0, 0.0), "yaw": (0.0, 0.0)},
+            "velocity_range": {
+                "x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0),
+                "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0),
+            },
+        }
+
+        # Reduce terrain to a single patch for visual play.
+        if self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.num_rows = 1
+            self.scene.terrain.terrain_generator.num_cols = 1
+            self.scene.terrain.terrain_generator.curriculum = False
+            self.scene.terrain.terrain_generator.size = (8.0, 8.0)
+
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+        # Disable observation corruption and external perturbations.
+        self.observations.policy.enable_corruption = False
+        self.observations.policy.height_scan.params["noise"] = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None

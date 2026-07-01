@@ -296,3 +296,37 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1DTCLitePPORunnerCfg",
     },
 )
+
+# BeamDojo: model-free foothold policy + sampling-based support reward
+# (Wang et al. 2025, arXiv:2502.10363). No model-based planner; the
+# policy chooses footholds and the reward scores actual stance quality.
+# TODO: switch to G1BeamDojoPPORunnerCfg once ActorCriticDoubleCritic is wired.
+gym.register(
+    id="AME-G1-29DOF-BeamDojo-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_BeamDojo",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-BeamDojo-Smoke-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_BeamDojo_SMOKE",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-BeamDojo-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_BeamDojo_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
