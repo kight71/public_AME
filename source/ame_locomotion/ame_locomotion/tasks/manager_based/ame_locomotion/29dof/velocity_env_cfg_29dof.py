@@ -1598,79 +1598,119 @@ class G1UrdfHeightMlpEnvCfg_PLAY(G1HeightMlpEnvCfg_PLAY):
 # Core deviation from the DTC / Footstep line: there is NO model-based
 # footstep planner. The policy chooses footholds itself; the environment
 # evaluates actual foot placement quality per stance step via a
-# sampling-based foothold reward (see mdp.rewards.foothold_sampling).
+# sampling-based foothold penalty (see mdp.rewards.foothold_penalty).
 # Does NOT use the Raibert / LIP target / phantom / vel_gate apparatus
 # assembled in the Footstep arm — those were the source of the
 # swing-tracking-vs-velocity-tracking saddle we kept hitting. BeamDojo
 # sidesteps that conflict by removing the reference target entirely.
 #
-# Configuration choices follow the BeamDojo paper:
-#   - drop the footstep_plan command entirely (planner is gone)
-#   - keep base velocity tracking as the dominant dense reward
-#   - add `foothold_sampling` (weight 6.0, paper default) as a "sparse"
-#     foothold-quality signal — only fires for feet actually in contact
-#   - Unitree-shaped base rewards (alive + foot_clearance + softer yaw/arms
-#     weights) to keep early random-policy exploration alive long enough for
-#     the sparse foothold reward to matter.
-#   - Stock stage-1 observation layout (no planner triplet), so the AME
-#     encoder / ActorCriticEncoder keeps its expected input shape and
-#     `pretrained/ame1.pt` could in principle warm-start (we don't here)
-#   - Reward weights otherwise inherited from `G1RoughEnvCfg_Unitree`; the
-#     dense gait shaping terms coexist cleanly with the sparse foothold term
-#     (BeamDojo's `double critic` separates dense vs sparse at PPO level,
-#     not at env reward level — that remains a follow-up once the single-
-#     critic signal is healthy).
+# Configuration follows BeamDojo paper Table VII (Appendix VI-A):
+#   - dense locomotion group + sparse foothold penalty (weight -1.0)
+#   - no Unitree alive/foot_clearance extras; no model-based planner
+# Double critic and two-stage soft/hard terrain remain follow-ups.
 # =========================================================================
+
+_BEAMDOJO_FOOTHOLD_PARAMS = {
+    "sensor_cfg": SceneEntityCfg(
+        "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+    ),
+    "height_scanner_name": "height_scanner",
+    "asset_cfg": SceneEntityCfg("robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
+    "foot_length": 0.18,
+    "foot_width": 0.065,
+    "n_long": 4,
+    "n_lat": 3,
+    "force_threshold": 1.0,
+    "sole_z_offset": -0.035409145057201385,
+}
 
 
 @configclass
-class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg_Unitree):
-    """BeamDojo env: no planner, sampling-based foothold reward.
-
-    Stage-1 first cut (this class): env-side scaffold.
-      - No `footstep_plan` command (planner fully removed).
-      - Add `foothold_sampling` reward (BeamDojo paper default weight=6.0).
-      - Inherit Unitree-style dense shaping (alive + foot_clearance) so early
-        exploration is not dominated by termination penalties.
-    The sparse-vs-dense critic separation (BeamDojo "double critic") is
-    a network concern and is intentionally not wired until the single-critic
-    BeamDojo reward has useful non-zero signal over a longer smoke run.
-    """
+class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
+    """BeamDojo env: paper Table VII rewards, no planner, sparse foothold penalty."""
 
     def __post_init__(self):
         super().__post_init__()
-        # Remove the model-based footstep planner entirely. BeamDojo is a
-        # model-free foothold policy — the policy decides where to step,
-        # and the environment scores the actual landing quality.
+
         self.commands.footstep_plan = None
-        # BeamDojo sampling-based foothold reward (sparse, only fires for
-        # stance feet). Weight follows the paper default; tuned later.
-        self.rewards.foothold_sampling = RewTerm(
-            func=mdp.foothold_sampling,
-            weight=6.0,
+
+        r = self.rewards
+        ankle_sensor = SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")
+        ankle_bodies = SceneEntityCfg("robot", body_names=".*_ankle_roll_link")
+
+        # --- Group 1: locomotion (BeamDojo Table VII) ---
+        r.track_lin_vel_xy_exp.weight = 1.0
+        r.track_lin_vel_xy_exp.params = {"command_name": "base_velocity", "std": 0.25}
+        r.track_ang_vel_z_exp.weight = 1.0
+        r.track_ang_vel_z_exp.params = {"command_name": "base_velocity", "std": 0.25}
+        r.base_height = RewTerm(
+            func=mdp.base_height_l2,
+            weight=-10.0,
             params={
-                "sensor_cfg": SceneEntityCfg(
-                    "contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
-                ),
-                "height_scanner_name": "height_scanner",
-                "asset_cfg": SceneEntityCfg(
-                    "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
-                ),
-                "foot_length": 0.18,
-                "foot_width": 0.065,
-                "n_long": 4,
-                "n_lat": 3,
-                "support_threshold": 0.03,
-                "force_threshold": 1.0,
-                "sole_z_offset": -0.035409145057201385,
+                "target_height": 0.725,
+                "asset_cfg": SceneEntityCfg("robot"),
+                "sensor_cfg": SceneEntityCfg("height_scanner"),
             },
         )
-        # `feet_slide` and friends stay (gait shaping, all dense). Planner-
-        # specific rewards (`footstep_swing_tracking`,
-        # `footstep_contact_phase`) are already weight=0 in the base cfg
-        # but ensuring they don't apply anyway:
-        self.rewards.footstep_swing_tracking.weight = 0.0
-        self.rewards.footstep_contact_phase.weight = 0.0
+        r.flat_orientation_l2.weight = -2.0
+        r.lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+        r.ang_vel_xy_l2.weight = -0.05
+        r.action_rate_l2.weight = -0.01
+        r.action_smoothness = RewTerm(func=mdp.action_smoothness_l2, weight=-1.0e-3)
+        r.stand_still = RewTerm(func=mdp.stand_still, weight=-0.05)
+        r.dof_vel_l2.weight = -1.0e-4
+        r.dof_acc_l2.weight = -2.5e-8
+        r.dof_pos_limits.weight = -5.0
+        r.dof_vel_limits = RewTerm(func=mdp.joint_vel_limits, weight=-1.0e-3, params={"soft_ratio": 1.0})
+        r.joint_power = RewTerm(func=mdp.joint_power, weight=-2.0e-5)
+        r.feet_ground_parallel = RewTerm(
+            func=mdp.feet_ground_parallel,
+            weight=-0.02,
+            params=dict(_BEAMDOJO_FOOTHOLD_PARAMS),
+        )
+        r.feet_distance_y = RewTerm(func=mdp.feet_distance_y, weight=0.5, params={"min_distance": 0.18})
+        r.feet_air_time = RewTerm(
+            func=mdp.feet_air_time,
+            weight=1.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": ankle_sensor,
+                "threshold": 0.5,
+            },
+        )
+        r.feet_clearance = RewTerm(
+            func=mdp.feet_height_body,
+            weight=-1.0,
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": ankle_bodies,
+                "target_height": 0.1,
+                "tanh_mult": 2.0,
+            },
+        )
+
+        # --- Group 2: sparse foothold ---
+        r.foothold = RewTerm(
+            func=mdp.foothold_penalty,
+            weight=-1.0,
+            params={**_BEAMDOJO_FOOTHOLD_PARAMS, "height_epsilon": -0.1},
+        )
+
+        # --- Disable non-paper / legacy terms ---
+        r.termination_penalty.weight = 0.0
+        r.undesired_contacts.weight = 0.0
+        r.dof_torques_l2.weight = 0.0
+        r.dof_torques_limits.weight = 0.0
+        r.feet_air_time_variance.weight = 0.0
+        r.feet_slide.weight = 0.0
+        r.feet_stumble.weight = 0.0
+        r.feet_too_near.weight = 0.0
+        r.joint_coordination.weight = 0.0
+        r.joint_deviation_hip.weight = 0.0
+        r.joint_deviation_arms.weight = 0.0
+        r.joint_deviation_waists.weight = 0.0
+        r.footstep_swing_tracking.weight = 0.0
+        r.footstep_contact_phase.weight = 0.0
 
 
 @configclass
