@@ -1718,6 +1718,49 @@ class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
 
 
 @configclass
+class G1RoughEnvCfg_BeamDojo_FLAT(G1RoughEnvCfg_BeamDojo):
+    """Flat-ground BeamDojo diagnostic config.
+
+    This keeps the BeamDojo reward stack but removes terrain difficulty and
+    early reset randomness so we can tell whether the policy/reward setup can
+    learn basic locomotion before adding foothold terrain.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+        self.scene.terrain.max_init_terrain_level = None
+        self.curriculum.terrain_levels = None
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        }
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
+        self.commands.base_velocity.ranges.lin_vel_x = (0.3, 0.6)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+        self.observations.policy.enable_corruption = False
+        self.observations.policy.height_scan.params["noise"] = False
+
+
+@configclass
 class G1RoughEnvCfg_BeamDojo_SMOKE(G1RoughEnvCfg_BeamDojo):
     """Low-memory BeamDojo config for random-agent and short smoke tests.
 
