@@ -28,6 +28,8 @@ parser.add_argument("--vis_height_samples", action="store_true", default=False, 
 parser.add_argument("--debug_policy_obs", action="store_true", default=False, help="Print key policy observations and actions for comparison with sim2sim.")
 parser.add_argument("--debug_every", type=int, default=20, help="Debug print period in simulation steps for --debug_policy_obs.")
 parser.add_argument("--debug_env_idx", type=int, default=0, help="Environment index to inspect for --debug_policy_obs.")
+parser.add_argument("--debug_foot_trajectory", action="store_true", default=False, help="Debug foot trajectories: sample actual vs prescribed swing curves.")
+parser.add_argument("--debug_foot_every", type=int, default=1, help="Debug foot trajectory period in simulation steps.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=300, help="Length of the recorded video (in steps).")
 parser.add_argument(
@@ -96,6 +98,14 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import ame_locomotion.tasks  # noqa: F401
+
+# import planner utilities for foot trajectory debugging
+try:
+    from ame_locomotion.tasks.manager_based.ame_locomotion.mdp.planner import swing_trajectory
+    SWING_TRAJECTORY_AVAILABLE = True
+except ImportError:
+    SWING_TRAJECTORY_AVAILABLE = False
+    print("[WARN] swing_trajectory not available; foot trajectory debug will be limited")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -201,6 +211,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     height_sample_visualizer = None
     identity_quat = None
     attention_num_bins = 8  # Number of discrete color bins
+    foot_trajectory_samples = []  # For foot trajectory debugging
 
     def _infer_scan_grid_shape() -> tuple[int, int] | None:
         """Infer the 2D scan grid shape (rows, cols) from encoder/env config."""
@@ -350,6 +361,240 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     def _debug_step_enabled() -> bool:
         return args_cli.debug_policy_obs and args_cli.debug_every > 0 and timestep % args_cli.debug_every == 0
+
+    def _foot_debug_enabled() -> bool:
+        return args_cli.debug_foot_trajectory and args_cli.debug_foot_every > 0 and timestep % args_cli.debug_foot_every == 0
+
+    # --- foot trajectory debug helpers ---
+    def _get_robot_foot_positions_and_velocities(env):
+        """Extract left/right foot positions and velocities from the robot articulation.
+
+        Returns: dict with keys 'left_foot_pos', 'left_foot_vel', 'right_foot_pos', 'right_foot_vel'
+        or None if unable to extract.
+        """
+        try:
+            scene = env.unwrapped.scene
+            # Try to access robot via scene indexing
+            robot = None
+            for key in ['robot', 'g1_robot', 'Robot']:
+                try:
+                    robot = scene[key]
+                    break
+                except KeyError:
+                    continue
+
+            if robot is None:
+                # Fallback: search articulations
+                if hasattr(scene, '_articulations') and len(scene._articulations) > 0:
+                    robot = list(scene._articulations.values())[0]
+                else:
+                    return None
+
+            robot_data = getattr(robot, "data", robot)
+            if not hasattr(robot_data, 'body_pos_w') or not hasattr(robot_data, 'body_lin_vel_w'):
+                return None
+
+            body_names = robot.body_names
+            body_pos = robot_data.body_pos_w  # (B, num_bodies, 3)
+            body_vel = robot_data.body_lin_vel_w  # (B, num_bodies, 3)
+
+            # Try to find left/right foot indices by pattern matching
+            result = {}
+            left_foot_idx = None
+            right_foot_idx = None
+
+            for i, name in enumerate(body_names):
+                name_lower = name.lower()
+                if left_foot_idx is None and ('l_' in name_lower or 'left' in name_lower) and ('ankle' in name_lower or 'foot' in name_lower):
+                    left_foot_idx = i
+                if right_foot_idx is None and ('r_' in name_lower or 'right' in name_lower) and ('ankle' in name_lower or 'foot' in name_lower):
+                    right_foot_idx = i
+
+            if left_foot_idx is not None:
+                result['left_foot_pos'] = body_pos[:, left_foot_idx:left_foot_idx+1, :].clone()  # (B, 1, 3)
+                result['left_foot_vel'] = body_vel[:, left_foot_idx:left_foot_idx+1, :].clone()  # (B, 1, 3)
+
+            if right_foot_idx is not None:
+                result['right_foot_pos'] = body_pos[:, right_foot_idx:right_foot_idx+1, :].clone()  # (B, 1, 3)
+                result['right_foot_vel'] = body_vel[:, right_foot_idx:right_foot_idx+1, :].clone()  # (B, 1, 3)
+
+            if len(result) == 0 and timestep == 0:
+                print(f"[INFO] Available bodies: {body_names[:10]}{'...' if len(body_names) > 10 else ''}")
+
+            return result if len(result) > 0 else None
+        except Exception as e:
+            if timestep == 0:
+                print(f"[WARN] Could not extract robot foot data: {e}")
+            return None
+
+    def _get_footstep_planner_state(env):
+        """Try to extract footstep planner command and phase information.
+
+        Returns: dict with keys like 'phase', 'planned_targets', etc. or None.
+        """
+        try:
+            # Try to access the command term from the environment
+            if not hasattr(env.unwrapped, 'command_manager'):
+                if timestep == 0:
+                    print("[INFO] command_manager not available")
+                return None
+
+            cmd_mgr = env.unwrapped.command_manager
+            if not hasattr(cmd_mgr, '_terms'):
+                if timestep == 0:
+                    print("[INFO] command_manager has no _terms")
+                return None
+
+            # List available terms on first call
+            if timestep == 0:
+                print(f"[INFO] Available command terms: {list(cmd_mgr._terms.keys())}")
+
+            for term_name, term_obj in cmd_mgr._terms.items():
+                if 'footstep' in term_name.lower() or 'planner' in term_name.lower():
+                    result = {}
+
+                    # Try to extract phase
+                    if hasattr(term_obj, 'stride_phase'):
+                        result['stride_phase'] = term_obj.stride_phase.clone()  # (B,)
+                    if hasattr(term_obj, 'phase'):
+                        result['stride_phase'] = term_obj.phase.clone()  # (B,)
+
+                    # Try to extract planned targets
+                    if hasattr(term_obj, 'target_footstep_w'):
+                        result['target_footstep_w'] = term_obj.target_footstep_w.clone()  # (B, F, 3)
+                    if hasattr(term_obj, 'target_w'):
+                        result['target_footstep_w'] = term_obj.target_w.clone()  # (B, F, 3)
+
+                    # Try to extract swing start positions
+                    if hasattr(term_obj, 'last_touchdown'):
+                        result['last_touchdown'] = term_obj.last_touchdown.clone()  # (B, F, 3)
+                    if hasattr(term_obj, 'last_contact_w'):
+                        result['last_touchdown'] = term_obj.last_contact_w.clone()  # (B, F, 3)
+
+                    # Try to extract swing phase per foot
+                    if hasattr(term_obj, 'swing_phase'):
+                        result['swing_phase'] = term_obj.swing_phase.clone()  # (B, F)
+                    elif hasattr(term_obj, 'phase') and hasattr(term_obj, 'cfg'):
+                        phase = term_obj.phase
+                        f = float(term_obj.cfg.t_swing_fraction)
+                        one_minus_f = 1.0 - f
+                        swing_phase_left = (phase / f).clamp(0.0, 1.0)
+                        swing_phase_right = ((phase - f) / one_minus_f).clamp(0.0, 1.0)
+                        result['swing_phase'] = torch.stack([swing_phase_left, swing_phase_right], dim=-1)
+                    if hasattr(term_obj, 'swing_foot'):
+                        result['swing_foot'] = term_obj.swing_foot.clone()
+
+                    if len(result) > 0 and timestep == 0:
+                        print(f"[INFO] Found footstep planner term: {term_name}, data keys: {list(result.keys())}")
+
+                    return result if len(result) > 0 else None
+
+            if timestep == 0:
+                print("[INFO] No footstep/planner command term found")
+            return None
+        except Exception as e:
+            if timestep % 100 == 0:
+                print(f"[WARN] Footstep planner state extraction error: {e}")
+            return None
+
+    def _sample_and_compare_trajectories(foot_data, planner_data, env_idx=0):
+        """Sample prescribed swing trajectory and compare with actual foot position.
+
+        Returns a dict with comparison metrics or None.
+        """
+        if not SWING_TRAJECTORY_AVAILABLE or foot_data is None or planner_data is None:
+            return None
+
+        try:
+            device = foot_data.get('left_foot_pos').device
+
+            # Get planner state
+            phase = planner_data.get('swing_phase', None)  # (B, F)
+            targets = planner_data.get('target_footstep_w', None)  # (B, F, 3)
+            last_touch = planner_data.get('last_touchdown', None)  # (B, F, 3)
+
+            if phase is None or targets is None or last_touch is None:
+                return None
+
+            prescribed = swing_trajectory(
+                start_w=last_touch[env_idx:env_idx + 1],
+                end_w=targets[env_idx:env_idx + 1],
+                phase=phase[env_idx:env_idx + 1],
+                apex=0.10,
+            )[0]  # (2, 3)
+
+            left_actual = foot_data.get('left_foot_pos', None)
+            right_actual = foot_data.get('right_foot_pos', None)
+            left_vel = foot_data.get('left_foot_vel', None)
+            right_vel = foot_data.get('right_foot_vel', None)
+
+            actual = torch.stack(
+                [
+                    left_actual[env_idx, 0, :] if left_actual is not None else torch.full_like(prescribed[0], float("nan")),
+                    right_actual[env_idx, 0, :] if right_actual is not None else torch.full_like(prescribed[1], float("nan")),
+                ],
+                dim=0,
+            )
+            actual_vel = torch.stack(
+                [
+                    left_vel[env_idx, 0, :] if left_vel is not None else torch.full_like(prescribed[0], float("nan")),
+                    right_vel[env_idx, 0, :] if right_vel is not None else torch.full_like(prescribed[1], float("nan")),
+                ],
+                dim=0,
+            )
+            err = torch.linalg.norm(prescribed - actual, dim=-1)
+            swing_foot = planner_data.get('swing_foot', None)
+            swing_foot_i = int(swing_foot[env_idx].item()) if swing_foot is not None else -1
+
+            result = {
+                'timestamp': timestep,
+                'env_idx': env_idx,
+                'phase': phase[env_idx].detach().cpu().numpy(),
+                'stride_phase': planner_data.get('stride_phase', torch.full((env_idx + 1,), float("nan"), device=device))[env_idx].item(),
+                'swing_foot': swing_foot_i,
+                'prescribed_pos': prescribed.detach().cpu().numpy(),
+                'actual_pos': actual.detach().cpu().numpy(),
+                'actual_vel': actual_vel.detach().cpu().numpy(),
+                'target': targets[env_idx].detach().cpu().numpy(),
+                'start': last_touch[env_idx].detach().cpu().numpy(),
+                'position_error': err.detach().cpu().numpy(),
+            }
+
+            return result
+        except Exception as e:
+            if timestep % 100 == 0:
+                print(f"[INFO] Trajectory sampling failed: {e}")
+            return None
+
+    def _print_foot_trajectory_sample(sample):
+        """Print a compact actual-vs-reference foot trajectory line."""
+        if sample is None:
+            return
+        phase = sample.get("phase")
+        err = sample.get("position_error")
+        actual = sample.get("actual_pos")
+        ref = sample.get("prescribed_pos")
+        target = sample.get("target")
+        vel = sample.get("actual_vel")
+        if actual is None or ref is None or target is None or err is None:
+            return
+
+        def _fmt_xyz(xyz):
+            return f"({xyz[0]:+.3f},{xyz[1]:+.3f},{xyz[2]:+.3f})"
+
+        swing_foot = sample.get("swing_foot", -1)
+        stride_phase = sample.get("stride_phase", float("nan"))
+        swing_name = "L" if swing_foot == 0 else "R" if swing_foot == 1 else "?"
+        print(
+            f"[FOOTDBG t={sample['timestamp']:05d} env={sample['env_idx']} "
+            f"stride={stride_phase:.3f} swing={swing_name}] "
+            f"phase(L,R)=({phase[0]:.2f},{phase[1]:.2f}) "
+            f"err(L,R)=({err[0]:.3f},{err[1]:.3f})m\n"
+            f"  L actual={_fmt_xyz(actual[0])} ref={_fmt_xyz(ref[0])} "
+            f"target={_fmt_xyz(target[0])} vel={_fmt_xyz(vel[0])}\n"
+            f"  R actual={_fmt_xyz(actual[1])} ref={_fmt_xyz(ref[1])} "
+            f"target={_fmt_xyz(target[1])} vel={_fmt_xyz(vel[1])}"
+        )
 
     def _print_policy_obs_debug(obs, actions: torch.Tensor):
         policy_terms = _extract_policy_terms(obs, num_actions=actions.shape[-1])
@@ -571,6 +816,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"clip_actions={agent_cfg.clip_actions}, terrain_obs_dim={terrain_obs_dim}"
         )
 
+    if args_cli.debug_foot_trajectory:
+        print(
+            f"[INFO] Foot trajectory debug enabled: every={args_cli.debug_foot_every} steps, "
+            f"swing_trajectory available={SWING_TRAJECTORY_AVAILABLE}"
+        )
+
     if args_cli.save_attention_weights:
         if args_cli.vis_attention:
             attention_visualizer = _build_attention_visualizer(env.unwrapped.device)
@@ -597,6 +848,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if _debug_step_enabled():
                     _print_policy_transition_debug(obs, actions)
 
+                # foot trajectory sampling
+                if _foot_debug_enabled():
+                    foot_data = _get_robot_foot_positions_and_velocities(env)
+                    planner_data = _get_footstep_planner_state(env)
+                    sample = _sample_and_compare_trajectories(foot_data, planner_data, env_idx=args_cli.debug_env_idx)
+                    if sample is not None:
+                        foot_trajectory_samples.append(sample)
+                        _print_foot_trajectory_sample(sample)
+
                 timestep += 1
                 # Exit the play loop after recording one video
                 if timestep == args_cli.video_length:
@@ -621,12 +881,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 obs, *_ = env.step(actions)
                 if _debug_step_enabled():
                     _print_policy_transition_debug(obs, actions)
+
+                # foot trajectory sampling
+                if _foot_debug_enabled():
+                    foot_data = _get_robot_foot_positions_and_velocities(env)
+                    planner_data = _get_footstep_planner_state(env)
+                    sample = _sample_and_compare_trajectories(foot_data, planner_data, env_idx=args_cli.debug_env_idx)
+                    if sample is not None:
+                        foot_trajectory_samples.append(sample)
+                        _print_foot_trajectory_sample(sample)
+
                 timestep += 1
             if args_cli.video:
                 # Exit the play loop after recording one video
                 if timestep == args_cli.video_length:
                     break
-            
+
             # time delay for real-time playback
             sleep_time = dt - (time.time() - start_time)
             if args_cli.real_time and sleep_time > 0:
@@ -637,6 +907,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         import numpy as np
         np.save(os.path.join(PROJ_ROOT_DIR, 'attention_weights.npy'), np.array(attention_weights_list))
         print(f"[INFO] Attention weights saved to attention_weights.npy, shape: {np.array(attention_weights_list).shape}")
+
+    # Save foot trajectory samples
+    if len(foot_trajectory_samples) > 0:
+        import json
+        import numpy as np
+
+        # Convert numpy arrays to lists for JSON serialization
+        serializable_samples = []
+        for sample in foot_trajectory_samples:
+            s = dict(sample)
+            for key in ['phase', 'prescribed_pos', 'actual_pos', 'actual_vel', 'target', 'start', 'position_error']:
+                if key in s and s[key] is not None:
+                    s[key] = s[key].tolist()
+            serializable_samples.append(s)
+
+        foot_traj_path = os.path.join(log_dir, 'foot_trajectory_debug.json')
+        os.makedirs(os.path.dirname(foot_traj_path), exist_ok=True)
+        with open(foot_traj_path, 'w') as f:
+            json.dump(serializable_samples, f, indent=2)
+
+        print(f"[INFO] Foot trajectory debug saved to {foot_traj_path}, {len(foot_trajectory_samples)} samples")
+
+        # Print summary statistics
+        if len(foot_trajectory_samples) > 0 and 'position_error' in foot_trajectory_samples[0]:
+            errors = [s.get('position_error', [0.0, 0.0]) for s in foot_trajectory_samples if 'position_error' in s]
+            if len(errors) > 0:
+                errors = np.array(errors)
+                print(
+                    f"  Position error: mean={errors.mean():.4f}m, "
+                    f"L_mean={errors[:, 0].mean():.4f}m, R_mean={errors[:, 1].mean():.4f}m, "
+                    f"min={errors.min():.4f}m, max={errors.max():.4f}m"
+                )
 
     # close the simulator
     env.close()

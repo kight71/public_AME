@@ -342,6 +342,26 @@ gym.register(
 )
 
 gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoV2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Flat-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoFlatV2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="AME-G1-29DOF-BeamDojo-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

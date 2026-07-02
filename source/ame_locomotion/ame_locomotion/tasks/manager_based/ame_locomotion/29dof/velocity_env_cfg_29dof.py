@@ -1718,6 +1718,41 @@ def _configure_forward_only_beamdojo(env_cfg: G1RoughEnvCfg):
     env_cfg.events.push_robot = None
 
 
+def _configure_mlp_beamdojo_v2_rewards(env_cfg: G1RoughEnvCfg):
+    r = env_cfg.rewards
+    ankle_sensor = SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")
+    ankle_bodies = SceneEntityCfg("robot", body_names=".*_ankle_roll_link")
+
+    r.track_lin_vel_xy_exp.weight = 2.0
+    r.track_lin_vel_xy_exp.params = {"command_name": "base_velocity", "std": 0.5}
+    r.base_height.weight = -1.0
+    r.flat_orientation_l2.weight = -0.5
+    r.feet_distance_y.weight = 0.0
+    r.feet_air_time = RewTerm(
+        func=mdp.feet_air_time_positive_biped,
+        weight=1.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": ankle_sensor,
+            "threshold": 0.3,
+        },
+    )
+    r.feet_clearance = RewTerm(
+        func=mdp.foot_clearance_reward_gated,
+        weight=0.5,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": ankle_bodies,
+            "sensor_cfg": ankle_sensor,
+            "target_height": 0.08,
+            "std": 0.05,
+            "tanh_mult": 2.0,
+        },
+    )
+    r.termination_penalty.weight = -200.0
+    r.alive.weight = 0.0
+
+
 @configclass
 class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
     """BeamDojo env: paper Table VII rewards, no planner, sparse foothold penalty."""
@@ -1848,6 +1883,28 @@ class G1MlpBeamDojoFlatEnvCfg(G1MlpBeamDojoEnvCfg):
             },
         }
         self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+
+
+@configclass
+class G1MlpBeamDojoV2EnvCfg(G1MlpBeamDojoEnvCfg):
+    """V2 mainline: make stepping positive and remove standing-reward shortcuts."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
+        _configure_mlp_beamdojo_v2_rewards(self)
+
+
+@configclass
+class G1MlpBeamDojoFlatV2EnvCfg(G1MlpBeamDojoFlatEnvCfg):
+    """Flat-ground V2 for learning forward stepping before rough-terrain curriculum."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (0.3, 0.8)
+        _configure_mlp_beamdojo_v2_rewards(self)
 
 
 @configclass

@@ -131,6 +131,32 @@ def foot_clearance_reward(
     return torch.exp(-torch.sum(reward, dim=1) / std)
 
 
+def foot_clearance_reward_gated(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+    tanh_mult: float,
+    min_command_speed: float = 0.1,
+) -> torch.Tensor:
+    """Positive swing-foot clearance reward with command, airborne, and velocity gates."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    foot_z_target_error = torch.square(asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - target_height)
+    foot_velocity_tanh = torch.tanh(tanh_mult * torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2))
+    is_airborne = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids] > 0.0
+
+    per_foot_reward = torch.exp(-foot_z_target_error / std) * foot_velocity_tanh * is_airborne.float()
+    reward = torch.sum(per_foot_reward, dim=1)
+
+    command_gate = torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > min_command_speed
+    upright_gate = torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward * command_gate * upright_gate
+
+
 def feet_too_near(
     env: ManagerBasedRLEnv, threshold: float = 0.2, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
