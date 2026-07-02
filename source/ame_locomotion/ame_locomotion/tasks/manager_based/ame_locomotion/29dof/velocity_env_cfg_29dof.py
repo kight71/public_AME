@@ -1634,6 +1634,10 @@ class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
         super().__post_init__()
 
         self.commands.footstep_plan = None
+        self.terminations.base_contact.params["sensor_cfg"] = SceneEntityCfg(
+            "contact_forces",
+            body_names=["torso_link", "pelvis"],
+        )
 
         r = self.rewards
         ankle_sensor = SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")
@@ -1698,7 +1702,7 @@ class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
         )
 
         # --- Early stability (complements paper rewards; reduces face-plant churn) ---
-        r.termination_penalty.weight = -200.0
+        r.termination_penalty.weight = 0.0
         r.alive = RewTerm(func=mdp.is_alive, weight=0.15)
 
         # --- Disable non-paper / legacy terms ---
