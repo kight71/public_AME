@@ -491,6 +491,7 @@ class TerminationsCfg:
                 # body_names=["torso_link"]
             ), "threshold": 1.0},
     )
+    bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8})
 
 @configclass
 class CurriculumCfg:
@@ -1470,6 +1471,44 @@ def _configure_height_mlp_env(env_cfg: G1RoughEnvCfg):
     env_cfg.observations.critic.height_scan.func = mdp.height_samples
 
 
+def _configure_flat_velgate_diagnostic(env_cfg: G1RoughEnvCfg, lin_vel_x: tuple[float, float]):
+    """Make a deterministic flat-ground reward/command diagnostic env."""
+
+    env_cfg.scene.terrain.terrain_type = "plane"
+    env_cfg.scene.terrain.terrain_generator = None
+    env_cfg.scene.terrain.max_init_terrain_level = None
+    env_cfg.curriculum.terrain_levels = None
+
+    env_cfg.commands.footstep_plan = None
+    env_cfg.commands.base_velocity.heading_command = False
+    env_cfg.commands.base_velocity.rel_standing_envs = 0.0
+    env_cfg.commands.base_velocity.rel_heading_envs = 0.0
+    env_cfg.commands.base_velocity.ranges.lin_vel_x = lin_vel_x
+    env_cfg.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+    env_cfg.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+    env_cfg.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+    env_cfg.events.physics_material = None
+    env_cfg.events.base_external_force_torque = None
+    env_cfg.events.push_robot = None
+    env_cfg.events.reset_base.params = {
+        "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
+        "velocity_range": {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        },
+    }
+    env_cfg.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+
+    env_cfg.observations.policy.enable_corruption = False
+    env_cfg.observations.policy.height_scan.params["noise"] = False
+    env_cfg.observations.critic.height_scan.params["noise"] = False
+
+
 @configclass
 class G1HeightMlpEnvCfg(G1RoughEnvCfg):
     """Configuration for the height-only MLP locomotion baseline."""
@@ -1486,6 +1525,24 @@ class G1HeightMlpEnvCfg_PLAY(G1RoughEnvCfg_PLAY):
     def __post_init__(self):
         super().__post_init__()
         _configure_height_mlp_env(self)
+
+
+@configclass
+class G1HeightMlpFlatVelGateEnvCfg(G1HeightMlpEnvCfg):
+    """Flat-ground HeightMLP reward diagnostic with the initial slow command band."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_flat_velgate_diagnostic(self, lin_vel_x=(0.0, 0.3))
+
+
+@configclass
+class G1HeightMlpFlatVelGateFastEnvCfg(G1HeightMlpEnvCfg):
+    """Second-stage flat-ground HeightMLP diagnostic after tracking reaches the threshold."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_flat_velgate_diagnostic(self, lin_vel_x=(0.3, 0.6))
 
 
 @configclass
@@ -1626,6 +1683,41 @@ _BEAMDOJO_FOOTHOLD_PARAMS = {
 }
 
 
+def _enable_low_risk_randomization(env_cfg: G1RoughEnvCfg):
+    env_cfg.events.add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
+            "mass_distribution_params": (-1.0, 3.0),
+            "operation": "add",
+        },
+    )
+    env_cfg.events.base_com = EventTerm(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
+            "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)},
+        },
+    )
+
+
+def _configure_forward_only_beamdojo(env_cfg: G1RoughEnvCfg):
+    env_cfg.commands.base_velocity.heading_command = False
+    env_cfg.commands.base_velocity.rel_standing_envs = 0.0
+    env_cfg.commands.base_velocity.rel_heading_envs = 0.0
+    env_cfg.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
+    env_cfg.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+    env_cfg.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+    env_cfg.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+    # Keep robustness randomization, but leave push recovery for a later stage.
+    _enable_low_risk_randomization(env_cfg)
+    env_cfg.events.base_external_force_torque = None
+    env_cfg.events.push_robot = None
+
+
 @configclass
 class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
     """BeamDojo env: paper Table VII rewards, no planner, sparse foothold penalty."""
@@ -1719,6 +1811,43 @@ class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
         r.joint_deviation_waists.weight = 0.0
         r.footstep_swing_tracking.weight = 0.0
         r.footstep_contact_phase.weight = 0.0
+
+
+@configclass
+class G1MlpBeamDojoEnvCfg(G1RoughEnvCfg_BeamDojo):
+    """Mainline HeightMLP + BeamDojo reward config on rough terrain curriculum."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        _configure_height_mlp_env(self)
+        _configure_forward_only_beamdojo(self)
+
+
+@configclass
+class G1MlpBeamDojoFlatEnvCfg(G1MlpBeamDojoEnvCfg):
+    """Flat-ground first-stage config for the HeightMLP + BeamDojo mainline."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+        self.scene.terrain.max_init_terrain_level = None
+        self.curriculum.terrain_levels = None
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        }
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
 
 
 @configclass

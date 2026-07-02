@@ -184,6 +184,26 @@ gym.register(
 )
 
 gym.register(
+    id="AME-G1-29DOF-HeightMLP-FlatVelGate-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1HeightMlpFlatVelGateEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-HeightMLP-FlatVelGateFast-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1HeightMlpFlatVelGateFastEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="AME-G1-29DOF-HeightMLP-ZeroCmd-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -301,6 +321,26 @@ gym.register(
 # (Wang et al. 2025, arXiv:2502.10363). No model-based planner; the
 # policy chooses footholds and the reward scores actual stance quality.
 # TODO: switch to G1BeamDojoPPORunnerCfg once ActorCriticDoubleCritic is wired.
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Flat-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoFlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
 gym.register(
     id="AME-G1-29DOF-BeamDojo-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
