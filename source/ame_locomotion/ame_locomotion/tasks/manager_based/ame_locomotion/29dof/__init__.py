@@ -362,6 +362,66 @@ gym.register(
 )
 
 gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Flat-Omni-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoFlatOmniV2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Flat-1mps-Play-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoFlat1mpsPlayV2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Omni-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoOmniV3EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Flat-Omni-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoFlatOmniV3EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Omni-v4",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoOmniV4EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-Flat-Omni-v4",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoFlatOmniV4EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="AME-G1-29DOF-BeamDojo-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

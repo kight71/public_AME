@@ -442,6 +442,19 @@ class RewardsCfg:
             )
         },
     )
+    joint_deviation_ankles = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    ".*_ankle_pitch_joint",
+                    ".*_ankle_roll_joint",
+                ],
+            )
+        },
+    )
 
     # ---- Phase 1: footstep-plan tracking (see PLAN.md) -------------------
     # Dense reward on swing-foot trajectory vs. the planner's reference.
@@ -1725,6 +1738,8 @@ def _configure_mlp_beamdojo_v2_rewards(env_cfg: G1RoughEnvCfg):
 
     r.track_lin_vel_xy_exp.weight = 2.0
     r.track_lin_vel_xy_exp.params = {"command_name": "base_velocity", "std": 0.5}
+    r.track_ang_vel_z_exp.weight = 1.0
+    r.track_ang_vel_z_exp.params = {"command_name": "base_velocity", "std": 0.5}
     r.base_height.weight = -1.0
     r.flat_orientation_l2.weight = -0.5
     r.feet_distance_y.weight = 0.0
@@ -1751,6 +1766,44 @@ def _configure_mlp_beamdojo_v2_rewards(env_cfg: G1RoughEnvCfg):
     )
     r.termination_penalty.weight = -200.0
     r.alive.weight = 0.0
+
+
+def _configure_mlp_beamdojo_v3_style_rewards(env_cfg: G1RoughEnvCfg):
+    _configure_mlp_beamdojo_v2_rewards(env_cfg)
+
+    r = env_cfg.rewards
+    # Tighten velocity tracking: sharper gradient near zero-error, and
+    # reduce the reward's dominance over posture/foot regularization.
+    # At std=0.25 an error of 0.22 gives reward ~0.92/step (vs ~1.65 at
+    # std=0.5), so posture penalties (~-0.6/step) now have real bite.
+    r.track_lin_vel_xy_exp.weight = 1.5
+    r.track_lin_vel_xy_exp.params = {"command_name": "base_velocity", "std": 0.25}
+    r.track_ang_vel_z_exp.weight = 1.5
+    r.track_ang_vel_z_exp.params = {"command_name": "base_velocity", "std": 0.25}
+
+    r.joint_deviation_hip.weight = -0.05
+    r.joint_deviation_arms.weight = -0.1
+    r.joint_deviation_waists.weight = -0.5
+    # Break the "left foot tipped up" asymmetric-gait basin baked in during
+    # stage-1 pretraining: much stronger ground-parallel penalty on the
+    # sole plus a hard default-pose anchor on ankle_pitch/ankle_roll.
+    r.joint_deviation_ankles.weight = -0.3
+    r.feet_ground_parallel.weight = -1.0
+
+
+def _configure_mlp_beamdojo_v4_foot_posture_rewards(env_cfg: G1RoughEnvCfg):
+    _configure_mlp_beamdojo_v3_style_rewards(env_cfg)
+
+    env_cfg.rewards.feet_orientation_l2 = RewTerm(
+        func=mdp.foot_orientation_l2,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+            )
+        },
+    )
 
 
 @configclass
@@ -1905,6 +1958,73 @@ class G1MlpBeamDojoFlatV2EnvCfg(G1MlpBeamDojoFlatEnvCfg):
 
         self.commands.base_velocity.ranges.lin_vel_x = (0.3, 0.8)
         _configure_mlp_beamdojo_v2_rewards(self)
+
+
+@configclass
+class G1MlpBeamDojoFlatOmniV2EnvCfg(G1MlpBeamDojoFlatV2EnvCfg):
+    """Flat-ground V2 with forward/backward, lateral, and yaw-rate commands."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.5, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.3, 0.3)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+
+@configclass
+class G1MlpBeamDojoFlat1mpsPlayV2EnvCfg(G1MlpBeamDojoFlatOmniV2EnvCfg):
+    """Flat-ground V2 play config with a fixed 1.0 m/s forward command."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+
+
+@configclass
+class G1MlpBeamDojoOmniV3EnvCfg(G1MlpBeamDojoV2EnvCfg):
+    """Rough-terrain omni V3 with lightweight posture and foot-orientation regularization."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.5, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.3, 0.3)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        _configure_mlp_beamdojo_v3_style_rewards(self)
+
+
+@configclass
+class G1MlpBeamDojoFlatOmniV3EnvCfg(G1MlpBeamDojoFlatOmniV2EnvCfg):
+    """Flat-ground omni V3 for fine-tuning posture before or alongside rough terrain."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        _configure_mlp_beamdojo_v3_style_rewards(self)
+
+
+@configclass
+class G1MlpBeamDojoOmniV4EnvCfg(G1MlpBeamDojoOmniV3EnvCfg):
+    """Rough-terrain omni V4 with direct foot pitch/roll orientation regularization."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        _configure_mlp_beamdojo_v4_foot_posture_rewards(self)
+
+
+@configclass
+class G1MlpBeamDojoFlatOmniV4EnvCfg(G1MlpBeamDojoFlatOmniV3EnvCfg):
+    """Flat-ground omni V4 for removing toe-up foot posture artifacts."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        _configure_mlp_beamdojo_v4_foot_posture_rewards(self)
 
 
 @configclass

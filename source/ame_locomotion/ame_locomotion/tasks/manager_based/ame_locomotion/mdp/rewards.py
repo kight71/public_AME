@@ -157,6 +157,20 @@ def foot_clearance_reward_gated(
     return reward * command_gate * upright_gate
 
 
+def foot_orientation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
+) -> torch.Tensor:
+    """Penalize foot pitch/roll tilt by aligning the foot local z axis with world z."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids]
+    local_z = torch.zeros((*foot_quat_w.shape[:-1], 3), device=foot_quat_w.device)
+    local_z[..., 2] = 1.0
+    foot_z_w = math_utils.quat_apply(foot_quat_w, local_z)
+    tilt_l2 = torch.sum(torch.square(foot_z_w[..., :2]), dim=-1)
+    return torch.sum(tilt_l2, dim=1)
+
+
 def feet_too_near(
     env: ManagerBasedRLEnv, threshold: float = 0.2, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
