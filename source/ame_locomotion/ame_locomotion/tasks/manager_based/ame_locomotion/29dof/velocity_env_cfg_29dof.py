@@ -24,6 +24,13 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ame_locomotion.tasks.manager_based.ame_locomotion import mdp
+from ame_locomotion.tasks.manager_based.ame_locomotion.mdp.foot_geometry_constants import (
+    G1_FOOT_LENGTH,
+    G1_FOOT_N_LAT,
+    G1_FOOT_N_LONG,
+    G1_FOOT_WIDTH,
+    G1_SOLE_Z_OFFSET,
+)
 # import isaaclab.terrains as terrain_gen
 import ame_locomotion.tasks.manager_based.ame_locomotion.terrains as terrain_gen
 
@@ -443,16 +450,23 @@ class RewardsCfg:
         },
     )
     joint_deviation_ankles = RewTerm(
-        func=mdp.joint_deviation_l1,
+        func=mdp.joint_deviation_l1_contact_gated,
         weight=0.0,
         params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    ".*_ankle_pitch_joint",
-                    ".*_ankle_roll_joint",
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+            ),
+            "foot_joint_names": [
+                [
+                    "left_ankle_pitch_joint",
+                    "left_ankle_roll_joint",
                 ],
-            )
+                [
+                    "right_ankle_pitch_joint",
+                    "right_ankle_roll_joint",
+                ],
+            ],
         },
     )
 
@@ -1687,12 +1701,12 @@ _BEAMDOJO_FOOTHOLD_PARAMS = {
     ),
     "height_scanner_name": "height_scanner",
     "asset_cfg": SceneEntityCfg("robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-    "foot_length": 0.18,
-    "foot_width": 0.065,
-    "n_long": 4,
-    "n_lat": 3,
+    "foot_length": G1_FOOT_LENGTH,
+    "foot_width": G1_FOOT_WIDTH,
+    "n_long": G1_FOOT_N_LONG,
+    "n_lat": G1_FOOT_N_LAT,
     "force_threshold": 1.0,
-    "sole_z_offset": -0.035409145057201385,
+    "sole_z_offset": G1_SOLE_Z_OFFSET,
 }
 
 

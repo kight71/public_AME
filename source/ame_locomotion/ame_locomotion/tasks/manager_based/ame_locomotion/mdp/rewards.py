@@ -10,6 +10,14 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.warp import raycast_mesh
 
+from .foot_geometry_constants import (
+    G1_FOOT_LENGTH,
+    G1_FOOT_N_LAT,
+    G1_FOOT_N_LONG,
+    G1_FOOT_WIDTH,
+    G1_SOLE_Z_OFFSET,
+)
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -73,6 +81,38 @@ def joint_position_penalty(
     body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
     reward = torch.linalg.norm((asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
     return torch.where(torch.logical_or(cmd > 0.0, body_vel > velocity_threshold), reward, stand_still_scale * reward)
+
+
+def joint_deviation_l1_contact_gated(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    foot_joint_names: list[list[str]],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize per-foot joint deviation from default only while that foot is in contact."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    if len(sensor_cfg.body_ids) != len(foot_joint_names):
+        raise RuntimeError(
+            "joint_deviation_l1_contact_gated expects one contact body per foot joint group; "
+            f"got {len(sensor_cfg.body_ids)} bodies and {len(foot_joint_names)} joint groups."
+        )
+
+    cache_name = "_joint_deviation_l1_contact_gated_joint_ids"
+    if not hasattr(env, cache_name):
+        setattr(
+            env,
+            cache_name,
+            [asset.find_joints(joint_names, preserve_order=True)[0] for joint_names in foot_joint_names],
+        )
+
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    for foot_idx, joint_ids in enumerate(getattr(env, cache_name)):
+        angle = asset.data.joint_pos[:, joint_ids] - asset.data.default_joint_pos[:, joint_ids]
+        penalty += torch.sum(torch.abs(angle), dim=1) * is_contact[:, foot_idx].float()
+    return penalty
 
 
 """
@@ -623,7 +663,7 @@ def planner_consistency(env: ManagerBasedRLEnv, command_name: str = "footstep_pl
     return (diff ** 2).sum(dim=(1, 2, 3))
 
 
-G1_ANKLE_ROLL_MESH_MIN_Z = -0.035409145057201385
+G1_ANKLE_ROLL_MESH_MIN_Z = G1_SOLE_Z_OFFSET
 _FOOTHOLD_FOOT_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 
@@ -673,10 +713,10 @@ def feet_ground_parallel(
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
         "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
     ),
-    foot_length: float = 0.18,
-    foot_width: float = 0.065,
-    n_long: int = 4,
-    n_lat: int = 3,
+    foot_length: float = G1_FOOT_LENGTH,
+    foot_width: float = G1_FOOT_WIDTH,
+    n_long: int = G1_FOOT_N_LONG,
+    n_lat: int = G1_FOOT_N_LAT,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
 ) -> torch.Tensor:
@@ -815,10 +855,10 @@ def foothold_sampling(
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
         "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
     ),
-    foot_length: float = 0.18,
-    foot_width: float = 0.065,
-    n_long: int = 4,
-    n_lat: int = 3,
+    foot_length: float = G1_FOOT_LENGTH,
+    foot_width: float = G1_FOOT_WIDTH,
+    n_long: int = G1_FOOT_N_LONG,
+    n_lat: int = G1_FOOT_N_LAT,
     support_threshold: float = 0.03,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
@@ -859,10 +899,10 @@ def foothold_penalty(
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
         "robot", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
     ),
-    foot_length: float = 0.18,
-    foot_width: float = 0.065,
-    n_long: int = 4,
-    n_lat: int = 3,
+    foot_length: float = G1_FOOT_LENGTH,
+    foot_width: float = G1_FOOT_WIDTH,
+    n_long: int = G1_FOOT_N_LONG,
+    n_lat: int = G1_FOOT_N_LAT,
     support_threshold: float = 0.03,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
