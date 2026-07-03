@@ -863,16 +863,19 @@ def foothold_penalty(
     foot_width: float = 0.065,
     n_long: int = 4,
     n_lat: int = 3,
-    height_epsilon: float = -0.1,
+    support_threshold: float = 0.03,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
 ) -> torch.Tensor:
-    """BeamDojo sparse foothold penalty (Table VII, weight -1.0).
+    """Foothold support-fraction penalty.
 
-    Returns ``sum_i C_i * sum_j 1{d_ij < epsilon}`` — positive magnitude to
-    multiply by a negative reward weight.
+    Measures how much of the foot sole is unsupported (terrain not
+    within *support_threshold* of the sole plane). Returns a value in
+    [0, 2] (one per foot, summed) to multiply by a negative weight.
+
+    0 = both feet fully supported, 2 = both feet fully unsupported.
     """
-    terrain_z, in_contact, _ = _foothold_sample_geometry(
+    _, in_contact, supported = _foothold_sample_geometry(
         env,
         sensor_cfg=sensor_cfg,
         height_scanner_name=height_scanner_name,
@@ -883,7 +886,8 @@ def foothold_penalty(
         n_lat=n_lat,
         force_threshold=force_threshold,
         sole_z_offset=sole_z_offset,
+        support_threshold=support_threshold,
     )
-    bad_samples = (terrain_z < height_epsilon).float()
-    per_foot = bad_samples.sum(dim=-1) * in_contact
+    unsupported_frac = 1.0 - supported.mean(dim=-1)
+    per_foot = unsupported_frac * in_contact
     return per_foot.sum(dim=1)

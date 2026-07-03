@@ -32,7 +32,7 @@ FINETUNE = False
 ##
 # Pre-defined configs
 ##
-from ame_locomotion.tasks.manager_based.ame_locomotion.terrains.terrain_cfg import ROUGH_TERRAINS_CFG  # isort: skip
+from ame_locomotion.tasks.manager_based.ame_locomotion.terrains.terrain_cfg import LOW_STEP_TERRAINS_CFG, ROUGH_TERRAINS_CFG  # isort: skip
 from ame_locomotion.tasks.manager_based.ame_locomotion.terrains.finetune_terrain_cfg import FINETUNE_ROUGH_TERRAINS_CFG
 from ame_locomotion.tasks.manager_based.ame_locomotion.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
 from ame_locomotion.tasks.manager_based.ame_locomotion.assets.robots.unitree import UNITREE_G1_29DOF_USD_FOOT_STL_CFG as ROBOT_USD_FOOT_STL_CFG
@@ -1878,7 +1878,7 @@ class G1RoughEnvCfg_BeamDojo(G1RoughEnvCfg):
         r.foothold = RewTerm(
             func=mdp.foothold_penalty,
             weight=-1.0,
-            params={**_BEAMDOJO_FOOTHOLD_PARAMS, "height_epsilon": -0.1},
+            params={**_BEAMDOJO_FOOTHOLD_PARAMS, "support_threshold": 0.03},
         )
 
         # --- Early stability (complements paper rewards; reduces face-plant churn) ---
@@ -2005,6 +2005,24 @@ class G1MlpBeamDojoFlatOmniV3EnvCfg(G1MlpBeamDojoFlatOmniV2EnvCfg):
         super().__post_init__()
 
         _configure_mlp_beamdojo_v3_style_rewards(self)
+
+
+@configclass
+class G1MlpBeamDojoTerrainCurriculumV3EnvCfg(G1MlpBeamDojoOmniV3EnvCfg):
+    """Omni V3 on a gentle low-step terrain curriculum.
+
+    Starts from a flat first terrain row and ramps pyramid stair height to
+    15 cm across the curriculum. Hollow stairs and rails are deliberately
+    excluded so the height encoder learns early without immediate reset churn.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = LOW_STEP_TERRAINS_CFG
+        self.scene.terrain.max_init_terrain_level = 0
+        self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
 
 
 @configclass

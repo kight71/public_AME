@@ -402,6 +402,16 @@ gym.register(
 )
 
 gym.register(
+    id="AME-G1-29DOF-MLP-BeamDojo-TerrainCurriculum-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1MlpBeamDojoTerrainCurriculumV3EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="AME-G1-29DOF-MLP-BeamDojo-Omni-v4",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
