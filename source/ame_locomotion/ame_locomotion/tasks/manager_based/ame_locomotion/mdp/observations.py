@@ -231,6 +231,25 @@ def footstep_phase_info(env: ManagerBasedRLEnv, command_name: str = "footstep_pl
     return info.flatten(start_dim=1)
 
 
+def footstep_foothold_score(
+    env: ManagerBasedRLEnv, command_name: str = "footstep_plan"
+) -> torch.Tensor:
+    """Per planned foothold quality score. Shape ``(B, N*2)``. Values in ``[0, 1]``.
+
+    Zero indicates the v2 selector used fallback (no valid candidate).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    return cmd.foothold_score_buffer.flatten(start_dim=1)
+
+
+def footstep_swing_side(
+    env: ManagerBasedRLEnv, command_name: str = "footstep_plan"
+) -> torch.Tensor:
+    """One-hot encoding of the current swing foot. Shape ``(B, 2)`` — ``[1,0]`` left, ``[0,1]`` right."""
+    cmd = env.command_manager.get_term(command_name)
+    return torch.nn.functional.one_hot(cmd.swing_foot, num_classes=2).float()
+
+
 def footstep_local_heightscan(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,

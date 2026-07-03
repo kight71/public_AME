@@ -15,10 +15,10 @@ import argparse
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Dump footstep-plan trajectories to npz.")
-parser.add_argument("--task", type=str, default="AME-G1-29DOF-HeightMLP-Play-v0")
+parser.add_argument("--task", type=str, default="AME-G1-29DOF-DTC-Play-v0")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--num_steps", type=int, default=500)
-parser.add_argument("--out", type=str, default="debug_plan.npz")
+parser.add_argument("--out", type=str, default="scripts/debug/output/debug_plan.npz")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -41,6 +41,10 @@ def main():
     env_cfg = parse_env_cfg(
         args.task, device=args.device, num_envs=args.num_envs, use_fabric=not args.disable_fabric
     )
+    # Play cfgs set num_envs=50 in __post_init__; force CLI value for lightweight dumps.
+    env_cfg.scene.num_envs = args.num_envs
+    if getattr(env_cfg.scene, "visualize_cam", None) is not None:
+        env_cfg.scene.visualize_cam = None
     env = gym.make(args.task, cfg=env_cfg)
     obs, _ = env.reset()
 
@@ -51,7 +55,7 @@ def main():
     buffers = {
         "root_pos": [], "root_vel": [], "root_yaw": [], "vel_cmd_b": [],
         "foot_pos_w": [], "plan_buffer": [], "last_contact_w": [],
-        "swing_foot": [], "phase": [],
+        "target_w": [], "swing_foot": [], "phase": [],
     }
 
     action = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
@@ -66,6 +70,7 @@ def main():
         buffers["foot_pos_w"].append(robot.data.body_pos_w[:, foot_ids].cpu().numpy().copy())
         buffers["plan_buffer"].append(footstep_term.plan_buffer.cpu().numpy().copy())
         buffers["last_contact_w"].append(footstep_term.last_contact_w.cpu().numpy().copy())
+        buffers["target_w"].append(footstep_term.target_w.cpu().numpy().copy())
         buffers["swing_foot"].append(footstep_term.swing_foot.cpu().numpy().copy())
         buffers["phase"].append(footstep_term.phase.cpu().numpy().copy())
 

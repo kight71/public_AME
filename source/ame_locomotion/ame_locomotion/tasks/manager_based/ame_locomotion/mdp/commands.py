@@ -16,6 +16,8 @@ from isaaclab.sensors import RayCaster
 from isaaclab.utils import configclass
 
 from . import planner as planner_ops
+from .foot_geometry_constants import G1_SOLE_Z_OFFSET
+from .gridmap_utils import grid_center_w_from_scanner_pos
 
 
 class TimeLimitedTerrainBasedPose2dCommand(TerrainBasedPose2dCommand):
@@ -137,7 +139,6 @@ class FootstepPlanCommand(CommandTerm):
             from isaaclab.sensors.ray_caster.patterns.patterns_cfg import GridPatternCfg as _GridPatternCfg
             pcfg = self.height_scanner.cfg.pattern_cfg
             if isinstance(pcfg, _GridPatternCfg):
-                import math as _math
                 W = round(pcfg.size[0] / pcfg.resolution) + 1  # x-direction cells
                 H = round(pcfg.size[1] / pcfg.resolution) + 1  # y-direction cells
                 self._cost_grid_shape = (H, W)
@@ -170,6 +171,15 @@ class FootstepPlanCommand(CommandTerm):
         self.time_left_buffer = torch.zeros(B, N, 2, device=self.device)
         # Static between commits; (1 = on ground at landing time, 0 = airborne)
         self.contact_target_buffer = torch.zeros(B, N, 2, device=self.device)
+        self.foothold_score_buffer = torch.zeros(B, N, 2, device=self.device)
+        self.used_fallback_buffer = torch.zeros(B, N, 2, dtype=torch.bool, device=self.device)
+        self.valid_count_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.per_cost_debug_buffer = torch.zeros(B, N, 2, 6, device=self.device)
+        # Per-mask survivor counts (k=0 plan step) for wandb attribution during Task 8a.
+        self.mask_reach_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_step_height_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_roughness_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_in_bounds_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
 
         # ---- phantom (virtual reference body) ---------------------------
         # Phantom is a virtual pelvis that advances by v_cmd every dt with a
@@ -184,6 +194,16 @@ class FootstepPlanCommand(CommandTerm):
 
         # metrics
         self.metrics["plan_step_mean_dx"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mean_score"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_fallback_rate"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_valid_count"] = torch.zeros(B, device=self.device)
+        # Per-mask mean valid counts (0–25) at the immediate plan step — attribution for Task 8a.
+        self.metrics["selector_v2_mask_reach_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_step_height_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_roughness_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_in_bounds_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_roughness_valid_L"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_roughness_valid_R"] = torch.zeros(B, device=self.device)
 
     # ---------------------------------------------------------------- API
 
@@ -206,6 +226,20 @@ class FootstepPlanCommand(CommandTerm):
         # dot with body-x (cos, sin)
         forward = (c.unsqueeze(-1) * dx + s.unsqueeze(-1) * dy).mean(dim=-1)
         self.metrics["plan_step_mean_dx"][:] = forward
+        self.metrics["selector_v2_mean_score"][:] = self.foothold_score_buffer[:, 0].mean(dim=-1)
+        self.metrics["selector_v2_fallback_rate"][:] = self.used_fallback_buffer[:, 0].float().mean(dim=-1)
+        self.metrics["selector_v2_valid_count"][:] = self.valid_count_buffer[:, 0].float().mean(dim=-1)
+        if self.cfg.use_selector_v2:
+            k0_reach = self.mask_reach_valid_buffer[:, 0].float()
+            k0_step_h = self.mask_step_height_valid_buffer[:, 0].float()
+            k0_rough = self.mask_roughness_valid_buffer[:, 0].float()
+            k0_bounds = self.mask_in_bounds_valid_buffer[:, 0].float()
+            self.metrics["selector_v2_mask_reach_valid"][:] = k0_reach.mean(dim=-1)
+            self.metrics["selector_v2_mask_step_height_valid"][:] = k0_step_h.mean(dim=-1)
+            self.metrics["selector_v2_mask_roughness_valid"][:] = k0_rough.mean(dim=-1)
+            self.metrics["selector_v2_mask_in_bounds_valid"][:] = k0_bounds.mean(dim=-1)
+            self.metrics["selector_v2_mask_roughness_valid_L"][:] = k0_rough[:, 0]
+            self.metrics["selector_v2_mask_roughness_valid_R"][:] = k0_rough[:, 1]
 
     def _resample_command(self, env_ids: Sequence[int]):
         # Episode-level reset: zero phase clock, latch current foot poses,
@@ -259,6 +293,12 @@ class FootstepPlanCommand(CommandTerm):
             f"  left  = {self.hip_offset_b[0].cpu().tolist()}\n"
             f"  right = {self.hip_offset_b[1].cpu().tolist()}"
         )
+
+    def _fallback_hip_params(self) -> tuple[float, float]:
+        """Body-frame |hip_y| and leg length from calibrated ``hip_offset_b``."""
+        hip_y = self.hip_offset_b[:, 1].abs().mean().item()
+        leg_length = self.hip_offset_b[:, 2].abs().mean().item()
+        return hip_y, leg_length
 
     def _update_phantom(self):
         """Advance phantom pelvis by v_cmd*dt, then leash to robot.
@@ -421,6 +461,21 @@ class FootstepPlanCommand(CommandTerm):
         # Snapshot previous plan for consistency reward.
         self.prev_plan_buffer[env_ids] = self.plan_buffer[env_ids].clone()
 
+        if self.cfg.use_selector_v2:
+            self._commit_plan_v2(
+                env_ids,
+                root_pos=root_pos,
+                root_yaw=root_yaw,
+                root_vel=root_vel,
+                vel_cmd_b=vel_cmd_b,
+                wz=wz,
+                swing_foot=swing_foot,
+                ray_hits_w=ray_hits_w,
+            )
+            return
+
+        env_count = env_ids.numel()
+        landing_yaws = torch.zeros(env_count, N, 2, device=self.device, dtype=root_yaw.dtype)
         for k in range(N):
             for foot_idx in range(2):
                 is_swing = (swing_foot == foot_idx).float()  # (E,)
@@ -431,6 +486,7 @@ class FootstepPlanCommand(CommandTerm):
                 # Per-foot yaw extrapolation (constant-wz approximation)
                 mid_yaw = root_yaw + 0.5 * horizon * wz
                 landing_yaw = root_yaw + horizon * wz
+                landing_yaws[:, k, foot_idx] = landing_yaw
 
                 # Velocity in world at the path midpoint orientation
                 c_mid = torch.cos(mid_yaw)
@@ -476,6 +532,284 @@ class FootstepPlanCommand(CommandTerm):
                 # at k=0 it's "still airborne now". For DTC observation purposes
                 # we use the *target* contact state at landing time = always 1.
                 self.contact_target_buffer[env_ids, k, foot_idx] = 1.0
+
+        self._write_foothold_quality_buffers(
+            env_ids,
+            plan_terrain_w=self.plan_buffer[env_ids],
+            landing_yaws=landing_yaws,
+            ray_hits_w=ray_hits_w,
+            used_fallback=False,
+        )
+
+    def _write_foothold_quality_buffers(
+        self,
+        env_ids: torch.Tensor,
+        *,
+        plan_terrain_w: torch.Tensor,
+        landing_yaws: torch.Tensor,
+        ray_hits_w: torch.Tensor,
+        used_fallback: bool | torch.Tensor = False,
+    ):
+        """Score committed plan points with the shared Task 0.5 geometry metric."""
+        if self._cost_grid_shape is None or self._cost_grid_resolution is None:
+            return
+
+        from . import foothold_selection
+
+        env_count = plan_terrain_w.shape[0]
+        n_steps, _ = plan_terrain_w.shape[1:3]
+        centers_fb = plan_terrain_w.clone()
+        centers_fb[..., 2] = plan_terrain_w[..., 2] - G1_SOLE_Z_OFFSET
+        flat_centers = centers_fb.reshape(env_count, n_steps * 2, 3)
+        flat_yaws = landing_yaws.reshape(env_count, n_steps * 2)
+        grid_center_w = grid_center_w_from_scanner_pos(self.height_scanner.data.pos_w[env_ids])
+        grid_yaw = self.robot.data.heading_w[env_ids]
+        scores = foothold_selection.foothold_quality_at_centers(
+            flat_centers,
+            flat_yaws,
+            ray_hits_w,
+            grid_shape=self._cost_grid_shape,
+            grid_resolution=self._cost_grid_resolution,
+            grid_center_w=grid_center_w,
+            grid_yaw=grid_yaw,
+        )
+        self.foothold_score_buffer[env_ids] = scores.reshape(env_count, n_steps, 2)
+        if isinstance(used_fallback, bool):
+            self.used_fallback_buffer[env_ids] = used_fallback
+        else:
+            self.used_fallback_buffer[env_ids] = used_fallback
+
+    def _raibert_targets_for_horizons(
+        self,
+        *,
+        root_pos: torch.Tensor,
+        root_yaw: torch.Tensor,
+        root_vel: torch.Tensor,
+        vel_cmd_b: torch.Tensor,
+        wz: torch.Tensor,
+        horizons: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(targets_w, landing_yaw, landing_root_pos)`` for per-foot horizons ``(E, 2)``.
+
+        ``landing_root_pos`` is the extrapolated pelvis xy/z used for Raibert priors;
+        pass it to :func:`select_foothold_v2` as ``body_pos_w`` so reachability is
+        evaluated in the landing body frame (not the current pelvis).
+        """
+        env_count = root_pos.shape[0]
+        targets = torch.zeros(env_count, 2, 3, device=self.device, dtype=root_pos.dtype)
+        landing_yaws = torch.zeros(env_count, 2, device=self.device, dtype=root_yaw.dtype)
+        landing_root_pos = torch.zeros(env_count, 2, 3, device=self.device, dtype=root_pos.dtype)
+        for foot_idx in range(2):
+            horizon = horizons[:, foot_idx]
+            mid_yaw = root_yaw + 0.5 * horizon * wz
+            landing_yaw = root_yaw + horizon * wz
+            c_mid = torch.cos(mid_yaw)
+            s_mid = torch.sin(mid_yaw)
+            vel_w_xy_mid = torch.stack(
+                [
+                    c_mid * vel_cmd_b[:, 0] - s_mid * vel_cmd_b[:, 1],
+                    s_mid * vel_cmd_b[:, 0] + c_mid * vel_cmd_b[:, 1],
+                ],
+                dim=-1,
+            )
+            root_pos_kf = root_pos.clone()
+            root_pos_kf[:, :2] = root_pos_kf[:, :2] + horizon.unsqueeze(-1) * vel_w_xy_mid
+            hip_offset_single = self.hip_offset_b[foot_idx : foot_idx + 1]
+            tgt = planner_ops.raibert_target(
+                root_pos_w=root_pos_kf,
+                root_lin_vel_w=root_vel,
+                root_yaw=landing_yaw,
+                vel_cmd_b=vel_cmd_b,
+                hip_offset_b=hip_offset_single,
+                t_swing=self._t_swing,
+                k_fb=self.cfg.raibert_k,
+                raibert_factor=self.cfg.raibert_factor,
+            )
+            targets[:, foot_idx] = tgt[:, 0]
+            landing_yaws[:, foot_idx] = landing_yaw
+            landing_root_pos[:, foot_idx] = root_pos_kf
+        return targets, landing_yaws, landing_root_pos
+
+    def _log_selector_v2_mask_debug(
+        self,
+        env_ids: torch.Tensor,
+        *,
+        k: int,
+        swing_foot: torch.Tensor,
+        horizons: torch.Tensor,
+        root_pos: torch.Tensor,
+        root_yaw: torch.Tensor,
+        landing_root_pos: torch.Tensor,
+        landing_yaw: torch.Tensor,
+        planned_terrain_z: torch.Tensor,
+        stance_terrain_z_w: torch.Tensor,
+        raibert_xy_w: torch.Tensor,
+        out: dict,
+    ) -> None:
+        """Print per-layer mask survival for env 0 (smoke / manual debug)."""
+        if not self.cfg.selector_v2_debug_masks or env_ids.numel() == 0:
+            return
+        # Only env 0 in the batch.
+        if 0 not in env_ids:
+            return
+        local = int((env_ids == 0).nonzero(as_tuple=False)[0].item())
+        phase = self.phase[0].item()
+        sw = int(swing_foot[local].item())
+        heading = self.robot.data.heading_w[0].item()
+        ryaw = root_yaw[local].item()
+
+        print(
+            f"[selector_v2 dbg] phase={phase:.3f} swing_foot={sw} k={k} "
+            f"horizons(L,R)={horizons[local, 0].item():.3f},{horizons[local, 1].item():.3f} "
+            f"root_yaw={ryaw:.4f} heading_w={heading:.4f} delta={abs(ryaw - heading):.6f}",
+            flush=True,
+        )
+        print(
+            f"  last_contact_z(L,R)={self.last_contact_w[0, :, 2].tolist()} "
+            f"planned_terrain_z(L,R)={planned_terrain_z[local].tolist()} "
+            f"stance_ref(L,R)={stance_terrain_z_w[local].tolist()}",
+            flush=True,
+        )
+        print(
+            f"  landing_root_xy(L,R)={landing_root_pos[local, :, :2].tolist()} "
+            f"current_root_xy={root_pos[local, :2].tolist()}",
+            flush=True,
+        )
+        print(
+            f"  raibert_xy(L,R)={raibert_xy_w[local, :, :2].tolist()}",
+            flush=True,
+        )
+
+        md = out.get("mask_debug")
+        if md is not None:
+            labels = (
+                ("reach", "reach_valid_count"),
+                ("step_height", "step_height_valid_count"),
+                ("roughness", "roughness_valid_count"),
+                ("in_bounds", "in_bounds_valid_count"),
+                ("combined", "combined_valid_count"),
+            )
+            for label, key in labels:
+                counts = md[key][local].tolist()
+                print(f"  {label}_valid: L={counts[0]} R={counts[1]}", flush=True)
+        print(
+            f"  selected: fallback={out['used_fallback'][local].tolist()} "
+            f"valid={out['valid_count'][local].tolist()} score={out['foothold_score'][local].tolist()}",
+            flush=True,
+        )
+
+    def _commit_plan_v2(
+        self,
+        env_ids: torch.Tensor,
+        *,
+        root_pos: torch.Tensor,
+        root_yaw: torch.Tensor,
+        root_vel: torch.Tensor,
+        vel_cmd_b: torch.Tensor,
+        wz: torch.Tensor,
+        swing_foot: torch.Tensor,
+        ray_hits_w: torch.Tensor,
+    ):
+        """Planner V2 commit: patch-stats foothold selector with chained stance-z accumulator."""
+        if self._cost_grid_shape is None or self._cost_grid_resolution is None:
+            raise ValueError(
+                "use_selector_v2 requires a GridPatternCfg height scanner so grid_shape/resolution "
+                "can be derived (see FootstepPlanCommand.__init__)."
+            )
+
+        from . import foothold_selection
+
+        N = self.cfg.n_future_steps
+        grid_center_w = grid_center_w_from_scanner_pos(self.height_scanner.data.pos_w[env_ids])
+        # Scanner grid is yaw-aligned to the robot, not the phantom reference body.
+        grid_yaw = self.robot.data.heading_w[env_ids]
+
+        planned_terrain_z = self.last_contact_w[env_ids, :, 2] + G1_SOLE_Z_OFFSET
+
+        self.foothold_score_buffer[env_ids] = 0.0
+        self.used_fallback_buffer[env_ids] = False
+        self.valid_count_buffer[env_ids] = 0
+        self.per_cost_debug_buffer[env_ids] = 0.0
+
+        for k in range(N):
+            is_swing = (swing_foot.unsqueeze(1) == torch.arange(2, device=self.device).view(1, 2)).float()
+            h_swing = k * self.cfg.t_step + self._t_swing
+            h_other = (k + 1) * self.cfg.t_step
+            horizons = is_swing * h_swing + (1.0 - is_swing) * h_other  # (E, 2)
+
+            raibert_xy_w, landing_yaw, landing_root_pos = self._raibert_targets_for_horizons(
+                root_pos=root_pos,
+                root_yaw=root_yaw,
+                root_vel=root_vel,
+                vel_cmd_b=vel_cmd_b,
+                wz=wz,
+                horizons=horizons,
+            )
+            stance_terrain_z_w = torch.stack(
+                [planned_terrain_z[:, 1], planned_terrain_z[:, 0]],
+                dim=1,
+            )
+            fallback_hip_y, fallback_leg_length = self._fallback_hip_params()
+            debug_masks = self.cfg.selector_v2_debug_masks
+
+            out = foothold_selection.select_foothold_v2(
+                raibert_xy_w,
+                ray_hits_w,
+                body_pos_w=landing_root_pos,
+                body_yaw=landing_yaw,
+                target_yaw=landing_yaw,
+                stance_terrain_z_w=stance_terrain_z_w,
+                grid_shape=self._cost_grid_shape,
+                grid_resolution=self._cost_grid_resolution,
+                grid_center_w=grid_center_w,
+                grid_yaw=grid_yaw,
+                max_step_dz=self.cfg.selector_v2_max_step_dz,
+                max_dz_omega=self.cfg.selector_v2_max_dz_omega,
+                w_terrain=self.cfg.selector_v2_w_terrain,
+                w_nominal=self.cfg.selector_v2_w_nominal,
+                w_reach=self.cfg.selector_v2_w_reach,
+                w_height=self.cfg.selector_v2_w_height,
+                w_edge=self.cfg.selector_v2_w_edge,
+                w_slope=self.cfg.selector_v2_w_slope,
+                lambda_support=self.cfg.selector_v2_lambda_support,
+                lambda_overhang=self.cfg.selector_v2_lambda_overhang,
+                fallback_hip_y=fallback_hip_y,
+                fallback_leg_length=fallback_leg_length,
+                return_mask_debug=True,
+            )
+
+            md = out.get("mask_debug")
+            if md is not None:
+                self.mask_reach_valid_buffer[env_ids, k] = md["reach_valid_count"]
+                self.mask_step_height_valid_buffer[env_ids, k] = md["step_height_valid_count"]
+                self.mask_roughness_valid_buffer[env_ids, k] = md["roughness_valid_count"]
+                self.mask_in_bounds_valid_buffer[env_ids, k] = md["in_bounds_valid_count"]
+
+            if debug_masks:
+                self._log_selector_v2_mask_debug(
+                    env_ids,
+                    k=k,
+                    swing_foot=swing_foot,
+                    horizons=horizons,
+                    root_pos=root_pos,
+                    root_yaw=root_yaw,
+                    landing_root_pos=landing_root_pos,
+                    landing_yaw=landing_yaw,
+                    planned_terrain_z=planned_terrain_z,
+                    stance_terrain_z_w=stance_terrain_z_w,
+                    raibert_xy_w=raibert_xy_w,
+                    out=out,
+                )
+
+            selected = out["selected_xyz_w"]
+            self.plan_buffer[env_ids, k] = selected
+            self.foothold_score_buffer[env_ids, k] = out["foothold_score"]
+            self.used_fallback_buffer[env_ids, k] = out["used_fallback"]
+            self.valid_count_buffer[env_ids, k] = out["valid_count"]
+            self.per_cost_debug_buffer[env_ids, k] = out["per_cost_debug"]
+            self.contact_target_buffer[env_ids, k] = 1.0
+
+            planned_terrain_z = selected[..., 2] + G1_SOLE_Z_OFFSET
 
     def _snap_z_via_nearest_ray(
         self, target_w: torch.Tensor, ray_hits_w: torch.Tensor
@@ -631,6 +965,23 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     """Roughness threshold (m) above which a cell is flagged as obstacle.
     0.15 m corresponds to a typical stair tread height — anything higher than
     that in a 10cm window is treated as an unstep-onable edge."""
+
+    use_selector_v2: bool = False
+    """When True, use :func:`foothold_selection.select_foothold_v2` (patch-stats
+    selector) instead of snap-to-ray or legacy cost selection."""
+
+    selector_v2_max_step_dz: float = 0.20
+    selector_v2_max_dz_omega: float = 0.10
+    selector_v2_w_terrain: float = 1.0
+    selector_v2_w_nominal: float = 0.5
+    selector_v2_w_reach: float = 1.0
+    selector_v2_w_height: float = 0.5
+    selector_v2_w_edge: float = 1.0
+    selector_v2_w_slope: float = 0.3
+    selector_v2_lambda_support: float = 1.0
+    selector_v2_lambda_overhang: float = 2.0
+    selector_v2_debug_masks: bool = False
+    """When True, print per-mask valid counts on each v2 commit (env 0, smoke/debug)."""
 
     hip_y: float = 0.10
     """Hardcoded |y| hip offset in body frame (Phase 0 approximation)."""

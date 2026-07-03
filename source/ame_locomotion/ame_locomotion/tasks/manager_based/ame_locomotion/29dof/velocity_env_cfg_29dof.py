@@ -757,6 +757,119 @@ class _FootstepCriticCfg(ObsGroup):
 
 
 @configclass
+class _PlannerV2PolicyCfg(ObsGroup):
+    """Planner V2 policy obs: DTC footstep triplet + quality signals; ``height_scan`` last (AME tail-slice).
+
+    Includes the Phase-1 planner triplet (``footstep_plan_xy``, ``footstep_phase_info``,
+    ``footstep_local_heightscan``) plus ``footstep_foothold_score`` / ``footstep_swing_side``
+    immediately before the global ``height_scan`` term.
+    """
+
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
+    projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-2.0, n_max=2.0))
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_local_heightscan = ObsTerm(
+        func=mdp.footstep_local_heightscan,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "half_size_m": 0.10,
+            "n_per_axis": 5,
+        },
+    )
+    footstep_foothold_score = ObsTerm(
+        func=mdp.footstep_foothold_score,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_swing_side = ObsTerm(
+        func=mdp.footstep_swing_side,
+        params={"command_name": "footstep_plan"},
+    )
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": True},
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True
+        self.concatenate_terms = True
+
+
+@configclass
+class _PlannerV2CriticCfg(ObsGroup):
+    """Planner V2 critic obs — footstep triplet + quality signals; ``height_scan`` last."""
+
+    base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
+    projected_gravity = ObsTerm(func=mdp.projected_gravity)
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_local_heightscan = ObsTerm(
+        func=mdp.footstep_local_heightscan,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "half_size_m": 0.10,
+            "n_per_axis": 5,
+        },
+    )
+    footstep_foothold_score = ObsTerm(
+        func=mdp.footstep_foothold_score,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_swing_side = ObsTerm(
+        func=mdp.footstep_swing_side,
+        params={"command_name": "footstep_plan"},
+    )
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
+    )
+
+
+def _configure_planner_v2_env(env_cfg, *, use_selector_v2: bool = True) -> None:
+    """Shared Planner V2 overrides for train/play and v2/legacy variants.
+
+    Gym IDs use ``G1AMEPPORunnerCfg`` (AME CNN+MHA), not ``G1DTCLitePPORunnerCfg``
+    (pure MLP). ``height_scan`` must remain the final obs term (AME tail-slice).
+    """
+    fp = env_cfg.commands.footstep_plan
+    fp.use_selector_v2 = use_selector_v2
+    fp.selector_v2_max_step_dz = 0.20
+    fp.selector_v2_max_dz_omega = 0.10
+    fp.selector_v2_w_terrain = 1.0
+    fp.selector_v2_w_nominal = 0.5
+    fp.selector_v2_w_reach = 1.0
+    fp.selector_v2_w_height = 0.5
+    fp.selector_v2_w_edge = 1.0
+    fp.selector_v2_w_slope = 0.3
+    env_cfg.rewards.footstep_swing_tracking.weight = 0.0
+    env_cfg.observations.policy = _PlannerV2PolicyCfg()
+    env_cfg.observations.critic = _PlannerV2CriticCfg()
+
+
+@configclass
 class G1RoughEnvCfg_Footstep(G1RoughEnvCfg):
     """Phase 1 footstep experiment — planner BOTH observed AND rewarded.
 
@@ -1298,6 +1411,49 @@ class G1RoughEnvCfg_DTC_FORWARD_PLAY(G1RoughEnvCfg_DTC_PLAY):
         # Disabled: debug print and Option B are validation-only.
         self.commands.footstep_plan.debug_print_period = 0
         self.commands.footstep_plan.phantom_yaw_track_robot = False
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2(G1RoughEnvCfg_DTC_FORWARD):
+    """Planner V2 train env — forward-only DTC + patch-stats foothold selector.
+
+    Uses ``G1AMEPPORunnerCfg`` (AME CNN+MHA terrain encoder), not the DTCLite
+    pure-MLP runner. Policy/critic obs include the footstep triplet, v2 quality
+    signals, and a trailing global ``height_scan`` for the AME tail-slice.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_v2_env(self, use_selector_v2=True)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LEGACY(G1RoughEnvCfg_DTC_PlannerV2):
+    """Matched-regime A/B control — same cfg as PlannerV2 but legacy selector."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.footstep_plan.use_selector_v2 = False
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
+    """Play config for Planner V2 foothold selector smoke / eval."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_v2_env(self, use_selector_v2=True)
+        self.observations.policy.enable_corruption = False
+        self.observations.policy.height_scan.params["noise"] = False
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LEGACY_PLAY(G1RoughEnvCfg_DTC_PlannerV2_PLAY):
+    """Play config for Planner V2 legacy A/B control."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.footstep_plan.use_selector_v2 = False
 
 
 def _configure_single_env_experiment_play(env_cfg: G1RoughEnvCfg_PLAY, terrain_cfg, forward_speed: float = 0.6):
