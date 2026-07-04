@@ -287,12 +287,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             return value.unsqueeze(0)
         return value
 
+    def _extract_policy_terms_from_manager(flat_policy: torch.Tensor) -> dict | None:
+        """Slice concatenated policy obs using ObservationManager term layout."""
+        try:
+            obs_mgr = env.unwrapped.observation_manager
+            names = obs_mgr.active_terms["policy"]
+            dims = obs_mgr.group_obs_term_dim["policy"]
+        except Exception:
+            return None
+
+        debug_key_for_term = {"actions": "last_action", "height_scan": "height_samples"}
+        extracted: dict[str, torch.Tensor] = {}
+        start = 0
+        for name, dim_tuple in zip(names, dims):
+            width = int(torch.tensor(dim_tuple, dtype=torch.long).prod().item())
+            extracted[debug_key_for_term.get(name, name)] = flat_policy[..., start : start + width]
+            start += width
+        if start != flat_policy.shape[-1]:
+            return None
+        return extracted
+
     def _extract_policy_terms(obs, num_actions: int):
         policy_group = _obs_lookup(obs, "policy")
         if policy_group is not None:
             if not isinstance(policy_group, torch.Tensor):
                 policy_group = torch.as_tensor(policy_group, device=env.unwrapped.device)
-            return _extract_policy_terms(_ensure_batch_dim(policy_group), num_actions)
+            policy_group = _ensure_batch_dim(policy_group)
+            managed = _extract_policy_terms_from_manager(policy_group)
+            if managed is not None:
+                return managed
+            # Legacy flat AME layout (proprio + height tail only).
+            obs = policy_group
 
         if isinstance(obs, torch.Tensor):
             terrain_obs_dim = int(getattr(policy_nn, "terrain_obs_dim", 0))
@@ -613,7 +638,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         joint_pos = policy_terms["joint_pos"][env_idx]
         joint_vel = policy_terms["joint_vel"][env_idx]
         last_action = policy_terms["last_action"][env_idx]
-        height_samples = policy_terms["height_samples"][env_idx]
+        height_samples = policy_terms.get("height_samples")
+        footstep_score = policy_terms.get("footstep_foothold_score")
         action = actions[env_idx]
         base_ang_vel_scale = _get_policy_term_scale("base_ang_vel", base_ang_vel.numel())
         joint_vel_scale = _get_policy_term_scale("joint_vel", joint_vel.numel())
@@ -625,7 +651,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"cmd={_fmt_vector(velocity_commands, 3)} "
             f"gyro_obs={_fmt_vector(base_ang_vel, 3)} "
             f"gyro_raw_est={_fmt_vector(base_ang_vel_raw, 3)} "
-            f"gravity={_fmt_vector(projected_gravity, 3)}"
+            f"gravity={_fmt_vector(projected_gravity, 3)} "
+            f"wz_cmd={velocity_commands[2].item():+.3f} wz_body={base_ang_vel_raw[2].item():+.3f}"
         )
         print(
             f"  joint_pos mean_abs={joint_pos.abs().mean().item():.4f} max_abs={joint_pos.abs().max().item():.4f} "
@@ -636,10 +663,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"  last_action mean_abs={last_action.abs().mean().item():.4f} max_abs={last_action.abs().max().item():.4f} "
             f"first={_fmt_vector(last_action)}"
         )
-        print(
-            f"  height mean={height_samples.mean().item():.4f} min={height_samples.min().item():.4f} "
-            f"max={height_samples.max().item():.4f} first={_fmt_vector(height_samples)}"
-        )
+        if height_samples is not None:
+            height_samples = height_samples[env_idx]
+            print(
+                f"  height mean={height_samples.mean().item():.4f} min={height_samples.min().item():.4f} "
+                f"max={height_samples.max().item():.4f} first={_fmt_vector(height_samples)}"
+            )
+        if footstep_score is not None:
+            print(f"  foothold_score={_fmt_vector(footstep_score[env_idx], 2)}")
         print(
             f"  action mean_abs={action.abs().mean().item():.4f} max_abs={action.abs().max().item():.4f} "
             f"top3={_fmt_topk_abs(action)}"

@@ -1076,9 +1076,8 @@ class G1RoughEnvCfg_DTC_FORWARD(G1RoughEnvCfg_DTC):
         # role), so yaw control is fully delegated to track_ang_vel_z_exp,
         # which we bump in weight below to compensate.
         self.commands.footstep_plan.phantom_yaw_track_robot = True
-        # Forward-only ablation: widen yaw-rate tracking so large early yaw
-        # errors still provide gradient instead of saturating to zero.
-        self.rewards.track_ang_vel_z_exp.params["std"] = 0.5
+        # Forward-only: both velocity kernels use std=0.25; weights unchanged below.
+        self.rewards.track_ang_vel_z_exp.params["std"] = 0.25
         # B mode delegates ALL yaw control to this term, so it must dominate
         # over track_lin_vel_xy_exp (weight 2.0) and footstep_swing_tracking
         # (weight 2.0). Otherwise PPO would learn to trade yaw for lin+swing
@@ -1087,7 +1086,7 @@ class G1RoughEnvCfg_DTC_FORWARD(G1RoughEnvCfg_DTC):
         self.rewards.track_ang_vel_z_exp.weight = 3.0
         # Same issue on forward velocity: keep gradients alive when the early
         # policy is far from the commanded speed.
-        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.5
+        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.25
         # Make correct left/right phase switching more valuable without adding
         # negative mismatch penalties that can suppress exploration.
         self.rewards.footstep_contact_phase.weight = 1.0
@@ -1410,7 +1409,9 @@ class G1RoughEnvCfg_DTC_FORWARD_PLAY(G1RoughEnvCfg_DTC_PLAY):
         self.commands.footstep_plan.n_future_steps = 1
         # Disabled: debug print and Option B are validation-only.
         self.commands.footstep_plan.debug_print_period = 0
-        self.commands.footstep_plan.phantom_yaw_track_robot = False
+        # Must match train (``G1RoughEnvCfg_DTC_FORWARD``): phantom yaw tracks
+        # robot heading so foot targets stay in the body-forward direction.
+        self.commands.footstep_plan.phantom_yaw_track_robot = True
 
 
 @configclass
@@ -1443,8 +1444,91 @@ class G1RoughEnvCfg_DTC_PlannerV2_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
     def __post_init__(self):
         super().__post_init__()
         _configure_planner_v2_env(self, use_selector_v2=True)
+        # Offline play: Nucleus arrow USD for command debug markers is often unavailable.
+        self.commands.base_velocity.debug_vis = False
+        self.commands.footstep_plan.debug_vis = False
         self.observations.policy.enable_corruption = False
         self.observations.policy.height_scan.params["noise"] = False
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_StepUp15_PLAY(G1RoughEnvCfg_DTC_PlannerV2_PLAY):
+    """PlannerV2 play on a single 15 cm up-step — flat approach, no pyramid descent.
+
+    Replaces the default hollow-stairs pyramid in ``DTC_PLAY`` so the robot can
+    walk forward continuously across one ledge instead of climbing up then down.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.episode_length_s = 60.0
+        self.viewer = MyViewerCfg()
+        self.viewer.eye = (3.6, -4.2, 2.2)
+        self.viewer.lookat = (3.4, 0.0, 0.45)
+
+        if self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.size = (10.0, 4.0)
+            self.scene.terrain.terrain_generator.border_width = 2.0
+            self.scene.terrain.terrain_generator.use_cache = False
+            self.scene.terrain.terrain_generator.sub_terrains = {
+                "single_step": terrain_gen.MeshSingleStepTerrainCfg(
+                    proportion=1.0,
+                    step_height=0.15,
+                    direction="up",
+                    step_x=3.2,
+                    spawn_x=1.2,
+                ),
+            }
+
+        self.commands.base_velocity.ranges.lin_vel_x = (0.6, 0.6)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_PyramidUp_PLAY(G1RoughEnvCfg_DTC_PlannerV2_PLAY):
+    """PlannerV2 play on solid pyramid stairs — spawn at the base, climb toward center."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.episode_length_s = 60.0
+        self.viewer = MyViewerCfg()
+        self.viewer.eye = (3.3, -5.0, 2.4)
+        self.viewer.lookat = (3.0, 0.0, 0.55)
+
+        if self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.size = (8.0, 8.0)
+            self.scene.terrain.terrain_generator.border_width = 1.0
+            self.scene.terrain.terrain_generator.use_cache = False
+            self.scene.terrain.terrain_generator.sub_terrains = {
+                "pyramid_stairs": terrain_gen.MeshSolidPyramidStairsTerrainCfg(
+                    proportion=1.0,
+                    border_width=1.0,
+                    step_height=0.15,
+                    step_width=0.30,
+                    platform_width=3.0,
+                    origin_mode="front_base",
+                ),
+            }
+
+        self.commands.base_velocity.ranges.lin_vel_x = (0.55, 0.55)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_HeadingPyramid_PLAY(G1RoughEnvCfg_DTC_PlannerV2_PyramidUp_PLAY):
+    """Pyramid play with heading command — experimental (train used ``wz=0`` velocity mode).
+
+    ``heading_target=0`` keeps the robot aimed at its spawn heading; the command
+    term converts heading error into ``ang_vel_z`` via P control each step.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.heading_command = True
+        self.commands.base_velocity.rel_heading_envs = 1.0
+        self.commands.base_velocity.heading_control_stiffness = 0.5
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
 
 @configclass
