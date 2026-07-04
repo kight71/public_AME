@@ -957,11 +957,11 @@ def _configure_planner_lipm_env(
 
 
 @configclass
-class _PlannerLIPMPaperMLPPolicyCfg(ObsGroup):
-    """Paper-style MLP policy obs — no global CNN ``height_scan``.
+class _PlannerLIPMPaperHeightMLPPolicyCfg(ObsGroup):
+    """Paper-style HeightMLP policy obs — ``height_samples`` must stay last.
 
-    Proprio + planner triplet (xyz plan, phase, swing side) + local height patch
-    around each planned foothold (DTCLite-style). Used with ``ActorCriticDTC``.
+    Proprio + planner (plan, phase, swing) + z-only height grid encoded by
+    ``ActorCriticTerrainMlp`` (``terrain_obs_dim=96``). No AME CNN+MHA.
     """
 
     base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
@@ -982,14 +982,9 @@ class _PlannerLIPMPaperMLPPolicyCfg(ObsGroup):
         func=mdp.footstep_swing_side,
         params={"command_name": "footstep_plan"},
     )
-    footstep_local_heightscan = ObsTerm(
-        func=mdp.footstep_local_heightscan,
-        params={
-            "command_name": "footstep_plan",
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "half_size_m": 0.10,
-            "n_per_axis": 5,
-        },
+    height_scan = ObsTerm(
+        func=mdp.height_samples,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": True},
     )
 
     def __post_init__(self):
@@ -998,8 +993,8 @@ class _PlannerLIPMPaperMLPPolicyCfg(ObsGroup):
 
 
 @configclass
-class _PlannerLIPMPaperMLPCriticCfg(ObsGroup):
-    """Paper MLP critic — privileged global ``height_scan`` + planner terms."""
+class _PlannerLIPMPaperHeightMLPCriticCfg(ObsGroup):
+    """Paper HeightMLP critic — same layout, noise-free height samples."""
 
     base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
     base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
@@ -1020,41 +1015,38 @@ class _PlannerLIPMPaperMLPCriticCfg(ObsGroup):
         func=mdp.footstep_swing_side,
         params={"command_name": "footstep_plan"},
     )
-    footstep_local_heightscan = ObsTerm(
-        func=mdp.footstep_local_heightscan,
-        params={
-            "command_name": "footstep_plan",
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "half_size_m": 0.10,
-            "n_per_axis": 5,
-        },
-    )
     height_scan = ObsTerm(
-        func=mdp.elevation_map,
+        func=mdp.height_samples,
         params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
     )
 
 
-def _configure_planner_lipm_paper_mlp_env(env_cfg) -> None:
-    """LIPM planner + thesis-style R_l landing reward + weakened swing + MLP obs.
+def _configure_planner_lipm_paper_height_mlp_env(env_cfg) -> None:
+    """LIPM + thesis R_l landing reward + weakened swing + HeightMLP encoder.
 
-    Rewards (Chen Long §4.4.3):
-      - ``footstep_landing_tracking`` (eq. 4-22) — primary foothold signal
-      - ``footstep_swing_tracking`` — weakened scaffold (not full trajectory shaping)
-      - ``footstep_contact_phase`` — small timing companion (approx. eq. 4-23)
+    Uses ``G1TerrainMlpPPORunnerCfg`` (``ActorCriticTerrainMlp``): z-only
+    ``height_samples`` grid (96-d) at the obs tail, small MLP terrain encoder —
+    same stack as ``AME-G1-29DOF-HeightMLP-v0``, not DTCLite / not AME CNN.
 
-    No ``overlap`` / ``foothold_penalty`` — terrain handled by LIPM + v2 selector.
-    Policy uses pure MLP (``G1DTCLitePPORunnerCfg`` / ``ActorCriticDTC``).
+    Rewards: ``footstep_landing_tracking`` (eq. 4-22) primary;
+    ``footstep_swing_tracking``=0.2 weakened; ``footstep_contact_phase``=0.1.
     """
     _configure_planner_lipm_env(env_cfg, use_placement_rewards=False)
-    env_cfg.observations.policy = _PlannerLIPMPaperMLPPolicyCfg()
-    env_cfg.observations.critic = _PlannerLIPMPaperMLPCriticCfg()
+    _configure_height_mlp_env(env_cfg)
+    env_cfg.observations.policy = _PlannerLIPMPaperHeightMLPPolicyCfg()
+    env_cfg.observations.critic = _PlannerLIPMPaperHeightMLPCriticCfg()
     r = env_cfg.rewards
     r.footstep_landing_tracking.weight = 1.0
     r.footstep_swing_tracking.weight = 0.2
     r.footstep_contact_phase.weight = 0.1
     r.footstep_placement_overlap.weight = 0.0
     r.foothold_penalty.weight = 0.0
+
+
+# Backward-compatible aliases (DTCLite naming was incorrect).
+_PlannerLIPMPaperMLPPolicyCfg = _PlannerLIPMPaperHeightMLPPolicyCfg
+_PlannerLIPMPaperMLPCriticCfg = _PlannerLIPMPaperHeightMLPCriticCfg
+_configure_planner_lipm_paper_mlp_env = _configure_planner_lipm_paper_height_mlp_env
 
 
 @configclass
@@ -1643,15 +1635,15 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM(G1RoughEnvCfg_DTC_FORWARD):
 
 @configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP(G1RoughEnvCfg_DTC_FORWARD):
-    """LIPM + paper R_l landing reward + weakened swing — pure MLP validation arm.
+    """LIPM + paper R_l landing reward + weakened swing — HeightMLP validation arm.
 
-    Train with ``G1DTCLitePPORunnerCfg`` (``ActorCriticDTC``). Upgrade to AME/CNN
-    only after this arm passes the iter-500 gate.
+    Train with ``G1TerrainMlpPPORunnerCfg`` (``ActorCriticTerrainMlp`` +
+    ``height_samples`` tail). Upgrade to AME CNN+MHA after iter-500 gate passes.
     """
 
     def __post_init__(self):
         super().__post_init__()
-        _configure_planner_lipm_paper_mlp_env(self)
+        _configure_planner_lipm_paper_height_mlp_env(self)
 
 
 @configclass
@@ -1660,7 +1652,7 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_PLAY(G1RoughEnvCfg_DTC_FORWARD_P
 
     def __post_init__(self):
         super().__post_init__()
-        _configure_planner_lipm_paper_mlp_env(self)
+        _configure_planner_lipm_paper_height_mlp_env(self)
         self.commands.base_velocity.debug_vis = False
         self.commands.footstep_plan.debug_vis = True
         self.commands.footstep_plan.selector_v2_debug_masks = False

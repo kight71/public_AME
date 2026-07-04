@@ -28,6 +28,7 @@ venv/
 .coverage
 htmlcov/
 scripts/debug/*
+!scripts/debug/run_lipm_paper_mlp_smoke.sh
 # Project artifacts
 logs/
 outputs/

@@ -209,7 +209,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1DTCLitePPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
     },
 )
 
@@ -219,7 +219,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1DTCLitePPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1TerrainMlpPPORunnerCfg",
     },
 )
 
