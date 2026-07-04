@@ -860,6 +860,92 @@ def _configure_planner_v2_env(
 
 
 @configclass
+class _PlannerLIPMPolicyCfg(ObsGroup):
+    """LIPM planner policy obs: footstep xy + phase/swing + global ``height_scan``."""
+
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
+    projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-2.0, n_max=2.0))
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_swing_side = ObsTerm(
+        func=mdp.footstep_swing_side,
+        params={"command_name": "footstep_plan"},
+    )
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": True},
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True
+        self.concatenate_terms = True
+
+
+@configclass
+class _PlannerLIPMCriticCfg(ObsGroup):
+    """LIPM planner critic obs — footstep xy + phase/swing + global ``height_scan``."""
+
+    base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
+    projected_gravity = ObsTerm(func=mdp.projected_gravity)
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_swing_side = ObsTerm(
+        func=mdp.footstep_swing_side,
+        params={"command_name": "footstep_plan"},
+    )
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
+    )
+
+
+def _configure_planner_lipm_env(
+    env_cfg,
+    *,
+    use_placement_rewards: bool = False,
+) -> None:
+    """LIPM prior + v2 selector; no phantom; swing tracking + phase obs enabled.
+
+    Flat-ground LIPM nominal (thesis eq. 4-5–4-11) + ``select_foothold_v2`` terrain
+    projection. Does **not** implement stair tread sequencing (eq. 4-12–4-17).
+    """
+    _configure_planner_v2_env(
+        env_cfg,
+        use_selector_v2=True,
+        use_placement_rewards=use_placement_rewards,
+    )
+    fp = env_cfg.commands.footstep_plan
+    fp.use_lipm_prior = True
+    fp.use_phantom = False
+    fp.raibert_factor = 0.0
+    fp.n_future_steps = 1
+    env_cfg.rewards.footstep_swing_tracking.weight = 1.0
+    env_cfg.observations.policy = _PlannerLIPMPolicyCfg()
+    env_cfg.observations.critic = _PlannerLIPMCriticCfg()
+
+
+@configclass
 class G1RoughEnvCfg_Footstep(G1RoughEnvCfg):
     """Phase 1 footstep experiment — planner BOTH observed AND rewarded.
 
@@ -1432,6 +1518,45 @@ class G1RoughEnvCfg_DTC_PlannerV2_PlaceRew(G1RoughEnvCfg_DTC_PlannerV2):
     def __post_init__(self):
         super().__post_init__()
         _configure_planner_v2_env(self, use_selector_v2=True, use_placement_rewards=True)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM(G1RoughEnvCfg_DTC_FORWARD):
+    """Planner V2 + 3D-LIPM/ICP nominal prior (no phantom)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_lipm_env(self, use_placement_rewards=False)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PlaceRew(G1RoughEnvCfg_DTC_PlannerV2_LIPM):
+    """LIPM prior + placement rewards + swing tracking."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_lipm_env(self, use_placement_rewards=True)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
+    """Play config for LIPM foothold planner smoke / eval."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_lipm_env(self, use_placement_rewards=False)
+        self.commands.base_velocity.debug_vis = False
+        self.commands.footstep_plan.debug_vis = True
+        self.commands.footstep_plan.selector_v2_debug_masks = False
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PlaceRew_PLAY(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PLAY):
+    """Play config for LIPM + placement rewards."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_lipm_env(self, use_placement_rewards=True)
 
 
 @configclass

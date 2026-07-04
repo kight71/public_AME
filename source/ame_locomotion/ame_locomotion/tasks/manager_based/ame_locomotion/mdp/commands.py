@@ -443,7 +443,7 @@ class FootstepPlanCommand(CommandTerm):
         Assumes ``t_swing_fraction = 0.5`` (no double-support).
         """
         N = self.cfg.n_future_steps
-        if self.cfg.use_phantom:
+        if self.cfg.use_phantom and not self.cfg.use_lipm_prior:
             # Targets anchored to phantom (idealized command-following body)
             # so they keep advancing even when the real robot stalls.
             root_pos = self.phantom_pos_w[env_ids]
@@ -630,6 +630,89 @@ class FootstepPlanCommand(CommandTerm):
             landing_root_pos[:, foot_idx] = root_pos_kf
         return targets, landing_yaws, landing_root_pos
 
+    def _lipm_targets_for_horizons(
+        self,
+        *,
+        root_pos: torch.Tensor,
+        root_yaw: torch.Tensor,
+        root_vel: torch.Tensor,
+        vel_cmd_b: torch.Tensor,
+        wz: torch.Tensor,
+        horizons: torch.Tensor,
+        swing_foot: torch.Tensor,
+        last_contact_w: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """LIPM nominal priors at step start (t=0) + landing body frames for v2 reach.
+
+        Nominal xy uses current root/CoM (no phantom). ``body_pos_w`` /
+        ``body_yaw`` match the Raibert branch: landing-time pelvis extrapolated
+        per-foot by ``horizons`` so ``select_foothold_v2`` reach masks stay valid.
+
+        Returns ``(nominal_xy_w, landing_yaw, landing_root_pos)`` — same contract
+        as :meth:`_raibert_targets_for_horizons`.
+        """
+        from . import planner_lipm
+
+        env_count = root_pos.shape[0]
+        targets = torch.zeros(env_count, 2, 3, device=self.device, dtype=root_pos.dtype)
+        landing_yaws = torch.zeros(env_count, 2, device=self.device, dtype=root_yaw.dtype)
+        landing_root_pos = torch.zeros(env_count, 2, 3, device=self.device, dtype=root_pos.dtype)
+
+        c_yaw = torch.cos(root_yaw)
+        s_yaw = torch.sin(root_yaw)
+        vel_cmd_xy_w = torch.stack(
+            [
+                c_yaw * vel_cmd_b[:, 0] - s_yaw * vel_cmd_b[:, 1],
+                s_yaw * vel_cmd_b[:, 0] + c_yaw * vel_cmd_b[:, 1],
+            ],
+            dim=-1,
+        )
+
+        env_idx = torch.arange(env_count, device=self.device)
+        stance_foot = 1 - swing_foot
+        # Paper: compute at footstep start t=0 → δT = T_s − t = T_s.
+        remaining_delta_t = self.cfg.t_step
+
+        lipm_xy = planner_lipm.lipm_nominal_foothold_xy(
+            com_xy=root_pos[:, :2],
+            com_vel_xy=root_vel[:, :2],
+            stance_foot_xy=last_contact_w[env_idx, stance_foot, :2],
+            swing_foot_xy=last_contact_w[env_idx, swing_foot, :2],
+            vel_cmd_xy=vel_cmd_xy_w,
+            swing_foot=swing_foot,
+            remaining_delta_t=remaining_delta_t,
+            step_duration_ts=self.cfg.t_step,
+            com_height=self.cfg.lipm_com_height,
+            step_width=self.cfg.lipm_step_width,
+            use_turning=self.cfg.lipm_use_turning,
+        )
+
+        for foot_idx in range(2):
+            horizon = horizons[:, foot_idx]
+            mid_yaw = root_yaw + 0.5 * horizon * wz
+            landing_yaw = root_yaw + horizon * wz
+            c_mid = torch.cos(mid_yaw)
+            s_mid = torch.sin(mid_yaw)
+            vel_w_xy_mid = torch.stack(
+                [
+                    c_mid * vel_cmd_b[:, 0] - s_mid * vel_cmd_b[:, 1],
+                    s_mid * vel_cmd_b[:, 0] + c_mid * vel_cmd_b[:, 1],
+                ],
+                dim=-1,
+            )
+            root_pos_kf = root_pos.clone()
+            root_pos_kf[:, :2] = root_pos_kf[:, :2] + horizon.unsqueeze(-1) * vel_w_xy_mid
+
+            is_swing = swing_foot == foot_idx
+            stance_xy = last_contact_w[:, foot_idx, :2]
+            foot_xy = torch.where(is_swing.unsqueeze(-1), lipm_xy, stance_xy)
+            targets[:, foot_idx, :2] = foot_xy
+            targets[:, foot_idx, 2] = 0.0
+            landing_yaws[:, foot_idx] = landing_yaw
+            landing_root_pos[:, foot_idx] = root_pos_kf
+
+        return targets, landing_yaws, landing_root_pos
+
     def _log_selector_v2_mask_debug(
         self,
         env_ids: torch.Tensor,
@@ -720,6 +803,14 @@ class FootstepPlanCommand(CommandTerm):
         from . import foothold_selection
 
         N = self.cfg.n_future_steps
+        if self.cfg.use_lipm_prior:
+            from . import planner_lipm
+
+            planner_lipm.validate_lipm_planner_config(
+                use_lipm_prior=True,
+                n_future_steps=N,
+            )
+
         grid_center_w = grid_center_w_from_scanner_pos(self.height_scanner.data.pos_w[env_ids])
         # Scanner grid is yaw-aligned to the robot, not the phantom reference body.
         grid_yaw = self.robot.data.heading_w[env_ids]
@@ -737,14 +828,26 @@ class FootstepPlanCommand(CommandTerm):
             h_other = (k + 1) * self.cfg.t_step
             horizons = is_swing * h_swing + (1.0 - is_swing) * h_other  # (E, 2)
 
-            raibert_xy_w, landing_yaw, landing_root_pos = self._raibert_targets_for_horizons(
-                root_pos=root_pos,
-                root_yaw=root_yaw,
-                root_vel=root_vel,
-                vel_cmd_b=vel_cmd_b,
-                wz=wz,
-                horizons=horizons,
-            )
+            if self.cfg.use_lipm_prior:
+                nominal_xy_w, body_yaw, body_pos_w = self._lipm_targets_for_horizons(
+                    root_pos=root_pos,
+                    root_yaw=root_yaw,
+                    root_vel=root_vel,
+                    vel_cmd_b=vel_cmd_b,
+                    wz=wz,
+                    horizons=horizons,
+                    swing_foot=swing_foot,
+                    last_contact_w=self.last_contact_w[env_ids],
+                )
+            else:
+                nominal_xy_w, body_yaw, body_pos_w = self._raibert_targets_for_horizons(
+                    root_pos=root_pos,
+                    root_yaw=root_yaw,
+                    root_vel=root_vel,
+                    vel_cmd_b=vel_cmd_b,
+                    wz=wz,
+                    horizons=horizons,
+                )
             stance_terrain_z_w = torch.stack(
                 [planned_terrain_z[:, 1], planned_terrain_z[:, 0]],
                 dim=1,
@@ -753,11 +856,11 @@ class FootstepPlanCommand(CommandTerm):
             debug_masks = self.cfg.selector_v2_debug_masks
 
             out = foothold_selection.select_foothold_v2(
-                raibert_xy_w,
+                nominal_xy_w,
                 ray_hits_w,
-                body_pos_w=landing_root_pos,
-                body_yaw=landing_yaw,
-                target_yaw=landing_yaw,
+                body_pos_w=body_pos_w,
+                body_yaw=body_yaw,
+                target_yaw=body_yaw,
                 stance_terrain_z_w=stance_terrain_z_w,
                 grid_shape=self._cost_grid_shape,
                 grid_resolution=self._cost_grid_resolution,
@@ -793,11 +896,11 @@ class FootstepPlanCommand(CommandTerm):
                     horizons=horizons,
                     root_pos=root_pos,
                     root_yaw=root_yaw,
-                    landing_root_pos=landing_root_pos,
-                    landing_yaw=landing_yaw,
+                    landing_root_pos=body_pos_w,
+                    landing_yaw=body_yaw,
                     planned_terrain_z=planned_terrain_z,
                     stance_terrain_z_w=stance_terrain_z_w,
-                    raibert_xy_w=raibert_xy_w,
+                    raibert_xy_w=nominal_xy_w,
                     out=out,
                 )
 
@@ -965,6 +1068,21 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     """Roughness threshold (m) above which a cell is flagged as obstacle.
     0.15 m corresponds to a typical stair tread height — anything higher than
     that in a 10cm window is treated as an unstep-onable edge."""
+
+    use_lipm_prior: bool = False
+    """When True, generate nominal foothold xy via 3D-LIPM/ICP (thesis §4.3.2 flat
+    ground, eq. 4-5–4-11) instead of Raibert + landing-horizon extrapolation.
+    Requires ``use_phantom=False`` and ``n_future_steps=1``. Terrain projection
+    still uses ``select_foothold_v2`` — not the stair-sequence rules (eq. 4-12–4-17)."""
+
+    lipm_com_height: float = 0.78
+    """Inverted-pendulum height z₀ for ω₀ = √(g/z₀)."""
+
+    lipm_step_width: float = 0.24
+    """Nominal step-width parameter w in wd = |w|·δT/T_s."""
+
+    lipm_use_turning: bool = True
+    """Apply eq. (4-11) velocity-heading rotation; False uses straight eq. (4-10)."""
 
     use_selector_v2: bool = False
     """When True, use :func:`foothold_selection.select_foothold_v2` (patch-stats

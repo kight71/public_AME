@@ -164,6 +164,46 @@ gym.register(
 )
 
 gym.register(
+    id="AME-G1-29DOF-DTC-PlannerV2-LIPM-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTC_PlannerV2_LIPM",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-DTC-PlannerV2-LIPM-PlaceRew-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTC_PlannerV2_LIPM_PlaceRew",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-DTC-PlannerV2-LIPM-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTC_PlannerV2_LIPM_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="AME-G1-29DOF-DTC-PlannerV2-LIPM-PlaceRew-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_29dof:G1RoughEnvCfg_DTC_PlannerV2_LIPM_PlaceRew_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.ame_rsl_rl_ppo_cfg:G1AMEPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="AME-G1-29DOF-DTC-PlannerV2-Legacy-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
