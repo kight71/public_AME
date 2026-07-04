@@ -981,3 +981,43 @@ def footstep_placement_overlap(
 
     per_foot = overlap_ratio * in_contact
     return per_foot.sum(dim=1)
+
+
+def footstep_landing_tracking(
+    env: ManagerBasedRLEnv,
+    command_name: str = "footstep_plan",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg(
+        "contact_forces", body_names=".*_ankle_roll_link"
+    ),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=".*_ankle_roll_link"
+    ),
+    force_threshold: float = 1.0,
+    sigma: float = 0.12,
+    use_xyz: bool = True,
+) -> torch.Tensor:
+    """Paper-style foothold tracking reward R_l — contact-time only.
+
+    Unlike :func:`footstep_swing_tracking`, this does **not** shape the swing
+    trajectory. It scores how close the **actual foot position** is to the
+    committed planner target while the foot is on the ground (thesis §4.4.3,
+    eq. 4-22).
+
+    Returns ``(B,)`` in ``[0, 2]`` (sum over contact feet).
+    """
+    from . import planner as planner_ops
+
+    cmd = env.command_manager.get_term(command_name)
+    target_w = cmd.target_w  # (B, 2, 3)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids]
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w_history.norm(dim=-1)
+    foot_forces = forces.max(dim=1).values[:, sensor_cfg.body_ids]
+    in_contact = (foot_forces > force_threshold).float()
+
+    return planner_ops.landing_tracking_exp(
+        foot_pos_w, target_w, in_contact, sigma, use_xyz=use_xyz
+    )

@@ -15,6 +15,7 @@ __all__ = [
     "project_onto_elevation_map",
     "swing_trajectory",
     "local_heightscan_around",
+    "landing_tracking_exp",
 ]
 
 
@@ -205,3 +206,23 @@ def local_heightscan_around(
     z_cell = ray_hits_w[b_idx, nearest, 2]  # (B, F, n*n)
 
     return z_cell - centers_w[..., 2:3]  # relative to center.z
+
+
+def landing_tracking_exp(
+    foot_pos_w: torch.Tensor,
+    target_w: torch.Tensor,
+    in_contact: torch.Tensor,
+    sigma: float,
+    *,
+    use_xyz: bool = True,
+) -> torch.Tensor:
+    """Thesis eq. (4-22): ``exp(-||p̂ - p||² / σ²)`` per foot, contact-gated.
+
+    Returns ``(B,)`` in ``[0, 2]`` when summed over both feet.
+    """
+    if use_xyz:
+        err2 = ((foot_pos_w - target_w) ** 2).sum(dim=-1)
+    else:
+        err2 = ((foot_pos_w[..., :2] - target_w[..., :2]) ** 2).sum(dim=-1)
+    per_foot = torch.exp(-err2 / (sigma * sigma)) * in_contact
+    return per_foot.sum(dim=-1)

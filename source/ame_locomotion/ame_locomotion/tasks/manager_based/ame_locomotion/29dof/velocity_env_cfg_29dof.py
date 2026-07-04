@@ -516,6 +516,17 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
         },
     )
+    # Chen Long thesis eq. (4-22): exp(-||p̂ - p||² / σ²) at foot contact only.
+    footstep_landing_tracking = RewTerm(
+        func=mdp.footstep_landing_tracking,
+        weight=0.0,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+            "sigma": 0.12,
+        },
+    )
 
 
 @configclass
@@ -943,6 +954,107 @@ def _configure_planner_lipm_env(
     env_cfg.rewards.footstep_swing_tracking.weight = 1.0
     env_cfg.observations.policy = _PlannerLIPMPolicyCfg()
     env_cfg.observations.critic = _PlannerLIPMCriticCfg()
+
+
+@configclass
+class _PlannerLIPMPaperMLPPolicyCfg(ObsGroup):
+    """Paper-style MLP policy obs — no global CNN ``height_scan``.
+
+    Proprio + planner triplet (xyz plan, phase, swing side) + local height patch
+    around each planned foothold (DTCLite-style). Used with ``ActorCriticDTC``.
+    """
+
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
+    projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-2.0, n_max=2.0))
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_swing_side = ObsTerm(
+        func=mdp.footstep_swing_side,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_local_heightscan = ObsTerm(
+        func=mdp.footstep_local_heightscan,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "half_size_m": 0.10,
+            "n_per_axis": 5,
+        },
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True
+        self.concatenate_terms = True
+
+
+@configclass
+class _PlannerLIPMPaperMLPCriticCfg(ObsGroup):
+    """Paper MLP critic — privileged global ``height_scan`` + planner terms."""
+
+    base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+    base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
+    projected_gravity = ObsTerm(func=mdp.projected_gravity)
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+    joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+    actions = ObsTerm(func=mdp.last_action)
+    footstep_plan_xy = ObsTerm(
+        func=mdp.footstep_plan,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_phase_info = ObsTerm(
+        func=mdp.footstep_phase_info,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_swing_side = ObsTerm(
+        func=mdp.footstep_swing_side,
+        params={"command_name": "footstep_plan"},
+    )
+    footstep_local_heightscan = ObsTerm(
+        func=mdp.footstep_local_heightscan,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "half_size_m": 0.10,
+            "n_per_axis": 5,
+        },
+    )
+    height_scan = ObsTerm(
+        func=mdp.elevation_map,
+        params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
+    )
+
+
+def _configure_planner_lipm_paper_mlp_env(env_cfg) -> None:
+    """LIPM planner + thesis-style R_l landing reward + weakened swing + MLP obs.
+
+    Rewards (Chen Long §4.4.3):
+      - ``footstep_landing_tracking`` (eq. 4-22) — primary foothold signal
+      - ``footstep_swing_tracking`` — weakened scaffold (not full trajectory shaping)
+      - ``footstep_contact_phase`` — small timing companion (approx. eq. 4-23)
+
+    No ``overlap`` / ``foothold_penalty`` — terrain handled by LIPM + v2 selector.
+    Policy uses pure MLP (``G1DTCLitePPORunnerCfg`` / ``ActorCriticDTC``).
+    """
+    _configure_planner_lipm_env(env_cfg, use_placement_rewards=False)
+    env_cfg.observations.policy = _PlannerLIPMPaperMLPPolicyCfg()
+    env_cfg.observations.critic = _PlannerLIPMPaperMLPCriticCfg()
+    r = env_cfg.rewards
+    r.footstep_landing_tracking.weight = 1.0
+    r.footstep_swing_tracking.weight = 0.2
+    r.footstep_contact_phase.weight = 0.1
+    r.footstep_placement_overlap.weight = 0.0
+    r.foothold_penalty.weight = 0.0
 
 
 @configclass
@@ -1527,6 +1639,31 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM(G1RoughEnvCfg_DTC_FORWARD):
     def __post_init__(self):
         super().__post_init__()
         _configure_planner_lipm_env(self, use_placement_rewards=False)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP(G1RoughEnvCfg_DTC_FORWARD):
+    """LIPM + paper R_l landing reward + weakened swing — pure MLP validation arm.
+
+    Train with ``G1DTCLitePPORunnerCfg`` (``ActorCriticDTC``). Upgrade to AME/CNN
+    only after this arm passes the iter-500 gate.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_lipm_paper_mlp_env(self)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
+    """Play config for LIPM paper-reward MLP smoke / eval."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_lipm_paper_mlp_env(self)
+        self.commands.base_velocity.debug_vis = False
+        self.commands.footstep_plan.debug_vis = True
+        self.commands.footstep_plan.selector_v2_debug_masks = False
 
 
 @configclass
