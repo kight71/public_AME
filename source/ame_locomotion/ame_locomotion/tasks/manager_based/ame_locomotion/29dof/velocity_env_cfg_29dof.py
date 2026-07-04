@@ -494,6 +494,28 @@ class RewardsCfg:
             "force_threshold": 1.0,
         },
     )
+    # BeamDojo-style foothold penalty: counts unsupported sole sample points
+    # when foot is in contact. Intended negative weight. Max raw = 24/step.
+    foothold_penalty = RewTerm(
+        func=mdp.foothold_penalty,
+        weight=0.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+            "support_threshold": 0.03,
+        },
+    )
+    # Rectangle overlap between actual foot placement and planner target.
+    # Positive reward in [0, 2] (sum over both feet).
+    footstep_placement_overlap = RewTerm(
+        func=mdp.footstep_placement_overlap,
+        weight=0.0,
+        params={
+            "command_name": "footstep_plan",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+        },
+    )
 
 
 @configclass
@@ -758,11 +780,10 @@ class _FootstepCriticCfg(ObsGroup):
 
 @configclass
 class _PlannerV2PolicyCfg(ObsGroup):
-    """Planner V2 policy obs: DTC footstep triplet + quality signals; ``height_scan`` last (AME tail-slice).
+    """Planner V2 policy obs: footstep xy + global ``height_scan`` (AME CNN tail-slice).
 
-    Includes the Phase-1 planner triplet (``footstep_plan_xy``, ``footstep_phase_info``,
-    ``footstep_local_heightscan``) plus ``footstep_foothold_score`` / ``footstep_swing_side``
-    immediately before the global ``height_scan`` term.
+    Local foothold height patches are omitted — the 33×21 elevation map already
+    covers the same terrain via CNN+MHA; ``footstep_plan_xy`` supplies where to attend.
     """
 
     base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
@@ -773,27 +794,6 @@ class _PlannerV2PolicyCfg(ObsGroup):
     actions = ObsTerm(func=mdp.last_action)
     footstep_plan_xy = ObsTerm(
         func=mdp.footstep_plan,
-        params={"command_name": "footstep_plan"},
-    )
-    footstep_phase_info = ObsTerm(
-        func=mdp.footstep_phase_info,
-        params={"command_name": "footstep_plan"},
-    )
-    footstep_local_heightscan = ObsTerm(
-        func=mdp.footstep_local_heightscan,
-        params={
-            "command_name": "footstep_plan",
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "half_size_m": 0.10,
-            "n_per_axis": 5,
-        },
-    )
-    footstep_foothold_score = ObsTerm(
-        func=mdp.footstep_foothold_score,
-        params={"command_name": "footstep_plan"},
-    )
-    footstep_swing_side = ObsTerm(
-        func=mdp.footstep_swing_side,
         params={"command_name": "footstep_plan"},
     )
     height_scan = ObsTerm(
@@ -808,7 +808,7 @@ class _PlannerV2PolicyCfg(ObsGroup):
 
 @configclass
 class _PlannerV2CriticCfg(ObsGroup):
-    """Planner V2 critic obs — footstep triplet + quality signals; ``height_scan`` last."""
+    """Planner V2 critic obs — footstep xy + global ``height_scan``."""
 
     base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
     base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2)
@@ -821,38 +821,26 @@ class _PlannerV2CriticCfg(ObsGroup):
         func=mdp.footstep_plan,
         params={"command_name": "footstep_plan"},
     )
-    footstep_phase_info = ObsTerm(
-        func=mdp.footstep_phase_info,
-        params={"command_name": "footstep_plan"},
-    )
-    footstep_local_heightscan = ObsTerm(
-        func=mdp.footstep_local_heightscan,
-        params={
-            "command_name": "footstep_plan",
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "half_size_m": 0.10,
-            "n_per_axis": 5,
-        },
-    )
-    footstep_foothold_score = ObsTerm(
-        func=mdp.footstep_foothold_score,
-        params={"command_name": "footstep_plan"},
-    )
-    footstep_swing_side = ObsTerm(
-        func=mdp.footstep_swing_side,
-        params={"command_name": "footstep_plan"},
-    )
     height_scan = ObsTerm(
         func=mdp.elevation_map,
         params={"sensor_cfg": SceneEntityCfg("height_scanner"), "noise": False},
     )
 
 
-def _configure_planner_v2_env(env_cfg, *, use_selector_v2: bool = True) -> None:
+def _configure_planner_v2_env(
+    env_cfg,
+    *,
+    use_selector_v2: bool = True,
+    use_placement_rewards: bool = False,
+) -> None:
     """Shared Planner V2 overrides for train/play and v2/legacy variants.
 
     Gym IDs use ``G1AMEPPORunnerCfg`` (AME CNN+MHA), not ``G1DTCLitePPORunnerCfg``
     (pure MLP). ``height_scan`` must remain the final obs term (AME tail-slice).
+
+    ``use_placement_rewards=True`` enables the BeamDojo foothold penalty and the
+    planner-target footstep overlap reward for A/B against the baseline PlannerV2
+    env (same selector, obs, and phantom — only these two reward weights differ).
     """
     fp = env_cfg.commands.footstep_plan
     fp.use_selector_v2 = use_selector_v2
@@ -865,6 +853,8 @@ def _configure_planner_v2_env(env_cfg, *, use_selector_v2: bool = True) -> None:
     fp.selector_v2_w_edge = 1.0
     fp.selector_v2_w_slope = 0.3
     env_cfg.rewards.footstep_swing_tracking.weight = 0.0
+    env_cfg.rewards.foothold_penalty.weight = -0.1 if use_placement_rewards else 0.0
+    env_cfg.rewards.footstep_placement_overlap.weight = 1.0 if use_placement_rewards else 0.0
     env_cfg.observations.policy = _PlannerV2PolicyCfg()
     env_cfg.observations.critic = _PlannerV2CriticCfg()
 
@@ -1419,13 +1409,29 @@ class G1RoughEnvCfg_DTC_PlannerV2(G1RoughEnvCfg_DTC_FORWARD):
     """Planner V2 train env — forward-only DTC + patch-stats foothold selector.
 
     Uses ``G1AMEPPORunnerCfg`` (AME CNN+MHA terrain encoder), not the DTCLite
-    pure-MLP runner. Policy/critic obs include the footstep triplet, v2 quality
-    signals, and a trailing global ``height_scan`` for the AME tail-slice.
+    pure-MLP runner. Policy/critic obs: ``footstep_plan_xy`` + global
+    ``height_scan`` (AME tail-slice). Placement rewards off — A/B control for
+    ``G1RoughEnvCfg_DTC_PlannerV2_PlaceRew``.
     """
 
     def __post_init__(self):
         super().__post_init__()
-        _configure_planner_v2_env(self, use_selector_v2=True)
+        _configure_planner_v2_env(self, use_selector_v2=True, use_placement_rewards=False)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_PlaceRew(G1RoughEnvCfg_DTC_PlannerV2):
+    """Planner V2 + placement rewards — matched A/B treatment vs ``PlannerV2``.
+
+    Adds ``foothold_penalty`` (weight -0.1) and ``footstep_placement_overlap``
+    (weight 1.0). Phantom still uses Option B (``phantom_yaw_track_robot=True``).
+    If this arm wins, follow up with ``phantom_yaw_track_robot=False`` (Option A)
+    to test whether the policy can track world-fixed ideal guidance.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_v2_env(self, use_selector_v2=True, use_placement_rewards=True)
 
 
 @configclass
@@ -1443,12 +1449,21 @@ class G1RoughEnvCfg_DTC_PlannerV2_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
 
     def __post_init__(self):
         super().__post_init__()
-        _configure_planner_v2_env(self, use_selector_v2=True)
+        _configure_planner_v2_env(self, use_selector_v2=True, use_placement_rewards=False)
         # Offline play: Nucleus arrow USD for command debug markers is often unavailable.
         self.commands.base_velocity.debug_vis = False
         self.commands.footstep_plan.debug_vis = False
         self.observations.policy.enable_corruption = False
         self.observations.policy.height_scan.params["noise"] = False
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_PlaceRew_PLAY(G1RoughEnvCfg_DTC_PlannerV2_PLAY):
+    """Play config for Planner V2 + placement rewards."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_planner_v2_env(self, use_selector_v2=True, use_placement_rewards=True)
 
 
 @configclass

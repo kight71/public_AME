@@ -907,13 +907,14 @@ def foothold_penalty(
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
 ) -> torch.Tensor:
-    """Foothold support-fraction penalty.
+    """BeamDojo-style foothold penalty (arXiv:2502.10363).
 
-    Measures how much of the foot sole is unsupported (terrain not
-    within *support_threshold* of the sole plane). Returns a value in
-    [0, 2] (one per foot, summed) to multiply by a negative weight.
+    For each foot in contact, counts the number of sole sample points
+    that are unsupported (terrain z below sole plane by more than
+    *support_threshold*). Returns the total count across both feet,
+    intended for use with a negative weight.
 
-    0 = both feet fully supported, 2 = both feet fully unsupported.
+    Output shape: ``(B,)`` in ``[0, 2*n_long*n_lat]`` (max = 24 with defaults).
     """
     _, in_contact, supported = _foothold_sample_geometry(
         env,
@@ -928,6 +929,55 @@ def foothold_penalty(
         sole_z_offset=sole_z_offset,
         support_threshold=support_threshold,
     )
-    unsupported_frac = 1.0 - supported.mean(dim=-1)
-    per_foot = unsupported_frac * in_contact
+    unsupported_count = (1.0 - supported).sum(dim=-1)
+    per_foot = unsupported_count * in_contact
+    return per_foot.sum(dim=1)
+
+
+def footstep_placement_overlap(
+    env: ManagerBasedRLEnv,
+    command_name: str = "footstep_plan",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg(
+        "contact_forces", body_names=".*_ankle_roll_link"
+    ),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=".*_ankle_roll_link"
+    ),
+    foot_length: float = G1_FOOT_LENGTH,
+    foot_width: float = G1_FOOT_WIDTH,
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Footstep placement overlap reward — rectangle IoU between actual foot
+    and planner target foot positions.
+
+    Both rectangles share the same dimensions (foot_length x foot_width) and
+    are assumed axis-aligned in body frame (valid when
+    ``phantom_yaw_track_robot=True``). The overlap ratio per foot is in [0, 1];
+    returned value is the contact-gated sum over both feet: ``(B,)`` in [0, 2].
+    """
+    cmd = env.command_manager.get_term(command_name)
+    target_w = cmd.target_w  # (B, 2, 3)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids]  # (B, 2, 3)
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w_history.norm(dim=-1)
+    foot_forces = forces.max(dim=1).values[:, sensor_cfg.body_ids]
+    in_contact = (foot_forces > force_threshold).float()  # (B, 2)
+
+    root_yaw = cmd.robot.data.heading_w  # (B,)
+    c = torch.cos(root_yaw)
+    s = torch.sin(root_yaw)
+
+    dx_w = foot_pos_w[..., 0] - target_w[..., 0]  # (B, 2)
+    dy_w = foot_pos_w[..., 1] - target_w[..., 1]
+    dx_b = c.unsqueeze(-1) * dx_w + s.unsqueeze(-1) * dy_w
+    dy_b = -s.unsqueeze(-1) * dx_w + c.unsqueeze(-1) * dy_w
+
+    overlap_x = (foot_length - dx_b.abs()).clamp(min=0.0)
+    overlap_y = (foot_width - dy_b.abs()).clamp(min=0.0)
+    overlap_ratio = (overlap_x * overlap_y) / (foot_length * foot_width)
+
+    per_foot = overlap_ratio * in_contact
     return per_foot.sum(dim=1)
