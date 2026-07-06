@@ -1705,6 +1705,30 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI(G1RoughEnvCfg_DTC_Plan
 
 
 @configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_XY(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT):
+    """Flat-ground xy-only diagnostic env for the LIPM PaperMLP pipeline."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.5, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+
+
+@configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_YAW(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT):
+    """Flat-ground yaw-only diagnostic env for the LIPM PaperMLP pipeline."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+
+@configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI_PLAY(
     G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI
 ):

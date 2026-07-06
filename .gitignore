@@ -30,7 +30,11 @@ htmlcov/
 scripts/debug/*
 !scripts/debug/run_lipm_paper_mlp_smoke.sh
 !scripts/debug/run_lipm_paper_mlp_flat_smoke.sh
+!scripts/debug/run_lipm_paper_mlp_flat_xy_smoke.sh
+!scripts/debug/run_lipm_paper_mlp_flat_yaw_smoke.sh
 !scripts/debug/run_lipm_paper_mlp_flat_omni_smoke.sh
+!scripts/debug/run_lipm_arc_model_smokes.sh
+!scripts/debug/run_lipm_arc_model_train.sh
 !scripts/debug/run_lipm_paper_mlp_flat_omni_play.sh
 !scripts/debug/plot_lipm_yaw_only_footholds.py
 
