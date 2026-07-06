@@ -23,6 +23,8 @@ __all__ = [
     "lipm_step_length",
     "lipm_offset_b",
     "lipm_nominal_foothold_xy",
+    "lipm_arc_nominal_foothold_xy",
+    "per_foot_effective_velocity",
     "validate_lipm_planner_config",
 ]
 
@@ -185,3 +187,77 @@ def lipm_nominal_foothold_xy(
     # separation preserved), not the stance foot (would collapse step width).
     p_hat = torch.where(stall.unsqueeze(-1), swing_foot_xy, p_hat)
     return p_hat
+
+
+def per_foot_effective_velocity(
+    vel_cmd_xy_w: torch.Tensor,
+    wz: torch.Tensor,
+    hip_offset_w: torch.Tensor,
+) -> torch.Tensor:
+    """Per-foot effective velocity: v_cmd_xy + wz x hip_offset (2D cross product).
+
+    The 2D cross product ``wz x (hx, hy) = (-wz*hy, wz*hx)`` gives each foot's
+    tangential velocity contribution from body rotation. This makes pure yaw
+    produce non-zero step lengths proportional to ``|wz| * hip_y``.
+
+    Args:
+        vel_cmd_xy_w: ``(B, 2)`` commanded linear velocity in world frame.
+        wz: ``(B,)`` yaw-rate command.
+        hip_offset_w: ``(B, 2, 2)`` per-foot hip offsets in world frame,
+            shape ``[batch, foot_idx, xy]``.
+
+    Returns:
+        ``(B, 2, 2)`` per-foot effective velocity ``[batch, foot_idx, xy]``.
+    """
+    tangent_x = -wz.unsqueeze(-1) * hip_offset_w[..., 1]
+    tangent_y = wz.unsqueeze(-1) * hip_offset_w[..., 0]
+    tangent = torch.stack([tangent_x, tangent_y], dim=-1)
+    return vel_cmd_xy_w.unsqueeze(1) + tangent
+
+
+def lipm_arc_nominal_foothold_xy(
+    landing_hip_xy: torch.Tensor,
+    effective_vel_xy: torch.Tensor,
+    swing_foot: torch.Tensor,
+    *,
+    remaining_delta_t: float | torch.Tensor,
+    step_duration_ts: float,
+    com_height: float | torch.Tensor,
+    step_width: float = 0.24,
+    arc_push_factor: float = 0.0,
+    eps: float = 1e-3,
+    g: float = 9.81,
+) -> torch.Tensor:
+    """Arc-aware nominal swing-foot xy anchored at the landing-time hip.
+
+    ``effective_vel_xy`` is the per-foot equivalent velocity
+    ``v_cmd_xy + wz x hip_offset``. It defines both the LIPM step length and the
+    heading used to rotate the dynamic offset around the landing hip.
+
+    For true zero command (no translation and no yaw), the target is the neutral
+    landing hip instead of the old ICP/stall fallback.
+    """
+    B = landing_hip_xy.shape[0]
+    z0 = (
+        torch.full((B,), com_height, device=landing_hip_xy.device, dtype=landing_hip_xy.dtype)
+        if isinstance(com_height, (int, float))
+        else com_height
+    )
+    omega0 = omega0_from_com_height(z0, g=g)
+
+    sd, wd = lipm_step_length(effective_vel_xy, remaining_delta_t, step_width, step_duration_ts)
+    bx, by = lipm_offset_b(sd, wd, remaining_delta_t, omega0)
+
+    side = _side_sign(swing_foot)
+    speed = torch.linalg.vector_norm(effective_vel_xy, dim=-1)
+    theta = torch.atan2(effective_vel_xy[:, 1], effective_vel_xy[:, 0])
+
+    off_x = arc_push_factor * sd - bx
+    off_y = side * by
+    c, s = torch.cos(theta), torch.sin(theta)
+    rot_x = c * off_x - s * off_y
+    rot_y = s * off_x + c * off_y
+    p_hat = landing_hip_xy + torch.stack([rot_x, rot_y], dim=-1)
+
+    return torch.where((speed < eps).unsqueeze(-1), landing_hip_xy, p_hat)
+

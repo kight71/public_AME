@@ -642,14 +642,14 @@ class FootstepPlanCommand(CommandTerm):
         swing_foot: torch.Tensor,
         last_contact_w: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """LIPM nominal priors at step start (t=0) + landing body frames for v2 reach.
+        """LIPM arc-model nominal priors using per-foot effective velocity.
 
-        Nominal xy uses current root/CoM (no phantom). ``body_pos_w`` /
-        ``body_yaw`` match the Raibert branch: landing-time pelvis extrapolated
-        per-foot by ``horizons`` so ``select_foothold_v2`` reach masks stay valid.
+        Uses ``lipm_arc_nominal_foothold_xy`` which computes per-foot
+        ``v_eff = v_cmd_xy + wz x hip_offset``, producing arc-shaped footstep
+        patterns for yaw commands without the old yaw-turn blend hack.
 
-        Returns ``(nominal_xy_w, landing_yaw, landing_root_pos)`` — same contract
-        as :meth:`_raibert_targets_for_horizons`.
+        Returns ``(nominal_xy_w, landing_yaw, landing_root_pos)`` — same
+        contract as :meth:`_raibert_targets_for_horizons`.
         """
         from . import planner_lipm
 
@@ -668,36 +668,15 @@ class FootstepPlanCommand(CommandTerm):
             dim=-1,
         )
 
-        env_idx = torch.arange(env_count, device=self.device)
-        stance_foot = 1 - swing_foot
-        # Paper: compute at footstep start t=0 → δT = T_s − t = T_s.
         remaining_delta_t = self.cfg.t_step
 
-        lipm_xy = planner_lipm.lipm_nominal_foothold_xy(
-            com_xy=root_pos[:, :2],
-            com_vel_xy=root_vel[:, :2],
-            stance_foot_xy=last_contact_w[env_idx, stance_foot, :2],
-            swing_foot_xy=last_contact_w[env_idx, swing_foot, :2],
-            vel_cmd_xy=vel_cmd_xy_w,
-            swing_foot=swing_foot,
-            remaining_delta_t=remaining_delta_t,
-            step_duration_ts=self.cfg.t_step,
-            com_height=self.cfg.lipm_com_height,
-            step_width=self.cfg.lipm_step_width,
-            use_turning=self.cfg.lipm_use_turning,
-        )
-        speed_xy = torch.linalg.vector_norm(vel_cmd_xy_w, dim=-1)
-        if self.cfg.lipm_yaw_turn_blend:
-            yaw_strength = (
-                (wz.abs() - self.cfg.lipm_yaw_turn_wz_deadband) / self.cfg.lipm_yaw_turn_wz_scale
-            ).clamp(0.0, 1.0)
-            low_speed = (
-                (self.cfg.lipm_yaw_turn_v_high - speed_xy)
-                / max(self.cfg.lipm_yaw_turn_v_high - self.cfg.lipm_yaw_turn_v_low, 1e-6)
-            ).clamp(0.0, 1.0)
-            yaw_blend = yaw_strength * low_speed
-        else:
-            yaw_blend = torch.zeros(env_count, device=self.device, dtype=root_pos.dtype)
+        # Build per-foot hip offsets in world frame (B, 2, 2)
+        hip_b_xy = self.hip_offset_b[:, :2].to(device=self.device, dtype=root_pos.dtype)
+        hip_w_x = c_yaw.unsqueeze(-1) * hip_b_xy[:, 0] - s_yaw.unsqueeze(-1) * hip_b_xy[:, 1]
+        hip_w_y = s_yaw.unsqueeze(-1) * hip_b_xy[:, 0] + c_yaw.unsqueeze(-1) * hip_b_xy[:, 1]
+        hip_offset_w = torch.stack([hip_w_x, hip_w_y], dim=-1)
+
+        v_eff_all = planner_lipm.per_foot_effective_velocity(vel_cmd_xy_w, wz, hip_offset_w)
 
         for foot_idx in range(2):
             horizon = horizons[:, foot_idx]
@@ -717,22 +696,25 @@ class FootstepPlanCommand(CommandTerm):
 
             is_swing = swing_foot == foot_idx
             stance_xy = last_contact_w[:, foot_idx, :2]
-            turn_delta = (
-                wz * horizon * self.cfg.lipm_yaw_turn_gain
-            ).clamp(-self.cfg.lipm_yaw_turn_max_delta, self.cfg.lipm_yaw_turn_max_delta)
-            turn_yaw = root_yaw + turn_delta
-            c_turn = torch.cos(turn_yaw)
-            s_turn = torch.sin(turn_yaw)
-            off_b = self.hip_offset_b[foot_idx, :2].to(device=self.device, dtype=root_pos.dtype)
-            yaw_xy = root_pos_kf[:, :2] + torch.stack(
+            off_b = hip_b_xy[foot_idx]
+            landing_hip_xy = root_pos_kf[:, :2] + torch.stack(
                 [
-                    c_turn * off_b[0] - s_turn * off_b[1],
-                    s_turn * off_b[0] + c_turn * off_b[1],
+                    torch.cos(landing_yaw) * off_b[0] - torch.sin(landing_yaw) * off_b[1],
+                    torch.sin(landing_yaw) * off_b[0] + torch.cos(landing_yaw) * off_b[1],
                 ],
                 dim=-1,
             )
-            swing_xy = (1.0 - yaw_blend).unsqueeze(-1) * lipm_xy + yaw_blend.unsqueeze(-1) * yaw_xy
-            foot_xy = torch.where(is_swing.unsqueeze(-1), swing_xy, stance_xy)
+            foot_side = torch.full_like(swing_foot, foot_idx)
+            arc_xy = planner_lipm.lipm_arc_nominal_foothold_xy(
+                landing_hip_xy=landing_hip_xy,
+                effective_vel_xy=v_eff_all[:, foot_idx],
+                swing_foot=foot_side,
+                remaining_delta_t=remaining_delta_t,
+                step_duration_ts=self.cfg.t_step,
+                com_height=self.cfg.lipm_com_height,
+                step_width=self.cfg.lipm_step_width,
+            )
+            foot_xy = torch.where(is_swing.unsqueeze(-1), arc_xy, stance_xy)
             targets[:, foot_idx, :2] = foot_xy
             targets[:, foot_idx, 2] = 0.0
             landing_yaws[:, foot_idx] = landing_yaw
@@ -1109,28 +1091,26 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     """Nominal step-width parameter w in wd = |w|·δT/T_s."""
 
     lipm_use_turning: bool = True
-    """Apply eq. (4-11) velocity-heading rotation; False uses straight eq. (4-10)."""
+    """Legacy parameter, no longer used by the arc-model planner. Kept for
+    checkpoint config backward-compat (ignored at runtime)."""
 
+    # -- Deprecated yaw-turn blend parameters (superseded by arc model) -------
+    # These are kept as fields so existing checkpoint configs don't fail to
+    # deserialize, but they have no effect on the arc-model LIPM path.
     lipm_yaw_turn_blend: bool = True
-    """Blend in a yaw-only nominal foothold at low translational speed and nonzero yaw command."""
-
+    """DEPRECATED: arc model handles yaw natively via per-foot v_eff."""
     lipm_yaw_turn_v_low: float = 0.05
-    """Below this planar speed, yaw-turn nominal can fully apply."""
-
+    """DEPRECATED."""
     lipm_yaw_turn_v_high: float = 0.25
-    """Above this planar speed, yaw-turn nominal is disabled."""
-
+    """DEPRECATED."""
     lipm_yaw_turn_wz_deadband: float = 0.15
-    """Yaw-rate deadband before yaw-turn nominal starts contributing."""
-
+    """DEPRECATED."""
     lipm_yaw_turn_wz_scale: float = 0.60
-    """Yaw-rate scale for ramping yaw-turn blend from 0 to 1."""
-
+    """DEPRECATED."""
     lipm_yaw_turn_gain: float = 0.50
-    """Scale applied to ``wz * horizon`` when rotating neutral foot offsets."""
-
+    """DEPRECATED."""
     lipm_yaw_turn_max_delta: float = 0.35
-    """Maximum yaw offset, in radians, used by yaw-turn nominal."""
+    """DEPRECATED."""
 
     use_selector_v2: bool = False
     """When True, use :func:`foothold_selection.select_foothold_v2` (patch-stats

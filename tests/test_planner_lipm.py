@@ -97,6 +97,121 @@ def test_zero_velocity_fallback_uses_swing_foot_not_stance(lipm):
     assert torch.linalg.vector_norm(out - stance, dim=-1).item() == pytest.approx(0.20, abs=1e-5)
 
 
+def test_per_foot_effective_velocity_pure_yaw(lipm):
+    v_cmd = torch.tensor([[0.0, 0.0]])
+    wz = torch.tensor([1.0])
+    hip_offset_w = torch.tensor([[[0.0, 0.12], [0.0, -0.12]]])
+
+    v_eff = lipm.per_foot_effective_velocity(v_cmd, wz, hip_offset_w)
+
+    expected = torch.tensor([[[-0.12, 0.0], [0.12, 0.0]]])
+    assert torch.allclose(v_eff, expected, atol=1e-6)
+
+
+def test_per_foot_effective_velocity_forward_matches_command(lipm):
+    v_cmd = torch.tensor([[0.5, -0.1]])
+    wz = torch.tensor([0.0])
+    hip_offset_w = torch.tensor([[[0.0, 0.12], [0.0, -0.12]]])
+
+    v_eff = lipm.per_foot_effective_velocity(v_cmd, wz, hip_offset_w)
+
+    assert torch.allclose(v_eff[:, 0], v_cmd, atol=1e-6)
+    assert torch.allclose(v_eff[:, 1], v_cmd, atol=1e-6)
+
+
+def test_arc_nominal_pure_yaw_moves_off_neutral_hip(lipm):
+    """Pure yaw should produce a tangential offset, not only a lateral width tweak."""
+    landing_hip = torch.tensor([[0.0, 0.12]])
+    v_eff = torch.tensor([[-0.12, 0.0]])
+    swing_side = torch.tensor([0], dtype=torch.long)
+
+    out = lipm.lipm_arc_nominal_foothold_xy(
+        landing_hip,
+        v_eff,
+        swing_side,
+        remaining_delta_t=0.6,
+        step_duration_ts=0.6,
+        com_height=0.78,
+        step_width=0.24,
+    )
+
+    assert torch.isfinite(out).all()
+    delta = out - landing_hip
+    assert delta[0, 0].item() > 0.005
+    assert delta[0, 1].item() < -0.005
+
+
+def test_arc_nominal_zero_command_returns_neutral_landing_hip(lipm):
+    """Zero effective speed has a neutral hip fallback, not an ICP/stall point."""
+    landing_hip = torch.tensor([[1.0, 2.0]])
+    v_eff = torch.tensor([[0.0, 0.0]])
+    swing_side = torch.tensor([1], dtype=torch.long)
+
+    out = lipm.lipm_arc_nominal_foothold_xy(
+        landing_hip,
+        v_eff,
+        swing_side,
+        remaining_delta_t=0.6,
+        step_duration_ts=0.6,
+        com_height=0.78,
+        step_width=0.24,
+    )
+
+    assert torch.allclose(out, landing_hip, atol=1e-6)
+
+
+def test_arc_effective_velocity_mixed_turn_inner_outer_lengths(lipm):
+    """Forward + yaw: outer foot (right for CCW) gets higher effective speed."""
+    v_cmd = torch.tensor([[0.5, 0.0]])
+    wz = torch.tensor([0.8])
+    hip_offset_w = torch.tensor([[[0.0, 0.12], [0.0, -0.12]]])
+
+    v_eff = lipm.per_foot_effective_velocity(v_cmd, wz, hip_offset_w)
+    speed = torch.linalg.vector_norm(v_eff, dim=-1)
+
+    assert speed[0, 1].item() > speed[0, 0].item()
+    assert speed[0, 1].item() / speed[0, 0].item() > 1.2
+
+
+def test_arc_nominal_forward_only_produces_forward_target(lipm):
+    """Pure forward (wz=0) should place target ahead of CoM."""
+    landing_hip = torch.tensor([[0.3, 0.12]])
+    v_eff = torch.tensor([[0.5, 0.0]])
+    swing_side = torch.tensor([0], dtype=torch.long)
+
+    out = lipm.lipm_arc_nominal_foothold_xy(
+        landing_hip,
+        v_eff,
+        swing_side,
+        remaining_delta_t=0.6,
+        step_duration_ts=0.6,
+        com_height=0.78,
+        step_width=0.24,
+    )
+
+    assert out[0, 0].item() > 0.1
+    assert out[0, 1].item() > 0.0
+
+
+def test_arc_nominal_arc_walk_inner_outer_asymmetry(lipm):
+    """Forward + yaw: inner vs outer foot has different effective velocity magnitudes.
+
+    With hip_x=0 and wz>0, the tangent is purely in x for both feet, so
+    single-step xy positions mirror symmetrically. The asymmetry manifests in
+    effective speed (step length over a cycle). We verify via v_eff speeds.
+    """
+    v_cmd = torch.tensor([[0.5, 0.0]])
+    wz = torch.tensor([0.8])
+    hip_offset_w = torch.tensor([[[0.0, 0.12], [0.0, -0.12]]])
+
+    v_eff = lipm.per_foot_effective_velocity(v_cmd, wz, hip_offset_w)
+    speed_left = torch.linalg.vector_norm(v_eff[0, 0]).item()
+    speed_right = torch.linalg.vector_norm(v_eff[0, 1]).item()
+
+    assert speed_right > speed_left
+    assert (speed_right - speed_left) > 0.15
+
+
 def test_validate_lipm_rejects_multi_step(lipm):
     with pytest.raises(ValueError, match="n_future_steps=1"):
         lipm.validate_lipm_planner_config(use_lipm_prior=True, n_future_steps=2)

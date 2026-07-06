@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Plot the ideal yaw-only LIPM foothold targets.
+"""Plot LIPM arc-model foothold targets for yaw and mixed commands.
 
-This is a lightweight offline view of the special branch in
-``FootstepPlanCommand._lipm_targets_for_horizons`` for the case where
-``vx = vy = 0`` and ``|wz|`` is large.  It does not run Isaac Sim or the policy;
-it just visualizes the nominal foothold positions produced by the planner math.
+Uses the new ``lipm_arc_nominal_foothold_xy`` (per-foot effective velocity)
+to visualize how the planner handles pure yaw, forward+yaw, and omni commands.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import math
 import os
 from pathlib import Path
@@ -21,147 +20,123 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+
+_LIPM_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "source/ame_locomotion/ame_locomotion/tasks/manager_based/ame_locomotion/mdp/planner_lipm.py"
+)
+
+
+def _load_lipm():
+    spec = importlib.util.spec_from_file_location("planner_lipm", _LIPM_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _rot2(yaw: float) -> np.ndarray:
-    c = math.cos(yaw)
-    s = math.sin(yaw)
+    c, s = math.cos(yaw), math.sin(yaw)
     return np.array([[c, -s], [s, c]], dtype=float)
 
 
-def _yaw_blend(
-    *,
-    vx: float,
-    vy: float,
-    wz: float,
-    v_low: float,
-    v_high: float,
-    wz_deadband: float,
-    wz_scale: float,
-) -> float:
-    speed_xy = math.hypot(vx, vy)
-    yaw_strength = np.clip((abs(wz) - wz_deadband) / wz_scale, 0.0, 1.0)
-    low_speed = np.clip((v_high - speed_xy) / max(v_high - v_low, 1e-6), 0.0, 1.0)
-    return float(yaw_strength * low_speed)
+def _simulate(lipm, args: argparse.Namespace) -> dict:
+    hip_b = np.array([[args.hip_x, +args.hip_y], [args.hip_x, -args.hip_y]])
 
-
-def _simulate(args: argparse.Namespace) -> dict[str, np.ndarray | float]:
-    hip = np.array(
-        [
-            [args.hip_x, +args.hip_y],
-            [args.hip_x, -args.hip_y],
-        ],
-        dtype=float,
-    )
-    contacts = hip.copy()
-    root_xy = np.array([0.0, 0.0], dtype=float)
+    contacts = hip_b.copy()
+    root_xy = np.array([0.0, 0.0])
     root_yaw = 0.0
     swing_foot = 0
     t_swing = args.t_step * args.t_swing_fraction
-    blend = _yaw_blend(
-        vx=args.vx,
-        vy=args.vy,
-        wz=args.wz,
-        v_low=args.v_low,
-        v_high=args.v_high,
-        wz_deadband=args.wz_deadband,
-        wz_scale=args.wz_scale,
-    )
 
-    root_xy_hist = [root_xy.copy()]
-    root_yaw_hist = [root_yaw]
+    root_hist = [root_xy.copy()]
+    yaw_hist = [root_yaw]
     left_hist = [contacts[0].copy()]
     right_hist = [contacts[1].copy()]
-    target_hist: list[np.ndarray] = []
-    ideal_landing_hist: list[np.ndarray] = []
-    swing_hist: list[int] = []
+    target_hist = []
+    swing_hist = []
 
     for _ in range(args.steps):
-        horizon = t_swing
-        turn_delta = np.clip(
-            args.wz * horizon * args.yaw_gain,
-            -args.max_delta,
-            args.max_delta,
+        c, s = math.cos(root_yaw), math.sin(root_yaw)
+        R = np.array([[c, -s], [s, c]])
+        vel_cmd_w = R @ np.array([args.vx, args.vy])
+        hip_w = (R @ hip_b.T).T
+
+        mid_yaw = root_yaw + 0.5 * args.wz * t_swing
+        c_m, s_m = math.cos(mid_yaw), math.sin(mid_yaw)
+        vel_mid = np.array([[c_m, -s_m], [s_m, c_m]]) @ np.array([args.vx, args.vy])
+        landing_root = root_xy + vel_mid * t_swing
+        landing_yaw = root_yaw + args.wz * t_swing
+        landing_hip = landing_root + _rot2(landing_yaw) @ hip_b[swing_foot]
+
+        v_cmd_t = torch.from_numpy(vel_cmd_w.astype(np.float32)).unsqueeze(0)
+        wz_t = torch.tensor([args.wz], dtype=torch.float32)
+        sw_t = torch.tensor([swing_foot], dtype=torch.long)
+        hip_w_t = torch.from_numpy(hip_w.astype(np.float32)).unsqueeze(0)
+        v_eff_t = lipm.per_foot_effective_velocity(v_cmd_t, wz_t, hip_w_t)[:, swing_foot]
+        landing_hip_t = torch.from_numpy(landing_hip.astype(np.float32)).unsqueeze(0)
+
+        target_t = lipm.lipm_arc_nominal_foothold_xy(
+            landing_hip_t,
+            v_eff_t,
+            sw_t,
+            remaining_delta_t=args.t_step, step_duration_ts=args.t_step,
+            com_height=args.com_height, step_width=args.step_width,
         )
-        yaw_special = root_xy + _rot2(root_yaw + turn_delta) @ hip[swing_foot]
-        ideal_landing = root_xy + _rot2(root_yaw + args.wz * horizon) @ hip[swing_foot]
-        lipm_stall_fallback = contacts[swing_foot]
-        target = (1.0 - blend) * lipm_stall_fallback + blend * yaw_special
+        target = target_t[0].numpy()
 
         contacts[swing_foot] = target
         target_hist.append(target.copy())
-        ideal_landing_hist.append(ideal_landing.copy())
         swing_hist.append(swing_foot)
         left_hist.append(contacts[0].copy())
         right_hist.append(contacts[1].copy())
 
-        root_xy = root_xy + np.array([args.vx, args.vy], dtype=float) * horizon
-        root_yaw = root_yaw + args.wz * horizon
-        root_xy_hist.append(root_xy.copy())
-        root_yaw_hist.append(root_yaw)
+        root_xy = landing_root
+        root_yaw = landing_yaw
+        root_hist.append(root_xy.copy())
+        yaw_hist.append(root_yaw)
         swing_foot = 1 - swing_foot
 
     return {
-        "root_xy": np.asarray(root_xy_hist),
-        "root_yaw": np.asarray(root_yaw_hist),
-        "left": np.asarray(left_hist),
-        "right": np.asarray(right_hist),
-        "target": np.asarray(target_hist),
-        "ideal_landing": np.asarray(ideal_landing_hist),
-        "swing": np.asarray(swing_hist),
-        "blend": blend,
+        "root_xy": np.array(root_hist),
+        "root_yaw": np.array(yaw_hist),
+        "left": np.array(left_hist),
+        "right": np.array(right_hist),
+        "target": np.array(target_hist),
+        "swing": np.array(swing_hist),
         "t_swing": t_swing,
     }
 
 
-def _plot(data: dict[str, np.ndarray | float], args: argparse.Namespace) -> None:
+def _plot(data: dict, args: argparse.Namespace) -> None:
     root_xy = data["root_xy"]
     root_yaw = data["root_yaw"]
     left = data["left"]
     right = data["right"]
     target = data["target"]
-    ideal_landing = data["ideal_landing"]
     swing = data["swing"]
-    blend = float(data["blend"])
-    t_swing = float(data["t_swing"])
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.plot(root_xy[:, 0], root_xy[:, 1], "k-", lw=1.5, alpha=0.6, label="root")
-    ax.plot(left[:, 0], left[:, 1], "o-", color="#1f77b4", lw=1.5, ms=5, label="left contact")
-    ax.plot(right[:, 0], right[:, 1], "o-", color="#d62728", lw=1.5, ms=5, label="right contact")
+    ax.plot(root_xy[:, 0], root_xy[:, 1], "k-", lw=2, alpha=0.6, label="CoM path")
+    ax.scatter(root_xy[0, 0], root_xy[0, 1], s=100, color="black", marker="s", zorder=6)
+    ax.plot(left[:, 0], left[:, 1], "o-", color="#2196F3", lw=1.2, ms=6, label="left foot", alpha=0.85)
+    ax.plot(right[:, 0], right[:, 1], "o-", color="#F44336", lw=1.2, ms=6, label="right foot", alpha=0.85)
 
-    left_targets = target[swing == 0]
-    right_targets = target[swing == 1]
-    if len(left_targets) > 0:
-        ax.scatter(left_targets[:, 0], left_targets[:, 1], s=85, color="#1f77b4", marker="x", label="planned L")
-    if len(right_targets) > 0:
-        ax.scatter(right_targets[:, 0], right_targets[:, 1], s=85, color="#d62728", marker="x", label="planned R")
-    ax.scatter(
-        ideal_landing[:, 0],
-        ideal_landing[:, 1],
-        s=38,
-        facecolors="none",
-        edgecolors="#444444",
-        alpha=0.65,
-        label="full landing-yaw neutral",
-    )
+    lt = target[swing == 0]
+    rt = target[swing == 1]
+    if len(lt) > 0:
+        ax.scatter(lt[:, 0], lt[:, 1], s=100, color="#2196F3", marker="*", zorder=5, label="target L")
+    if len(rt) > 0:
+        ax.scatter(rt[:, 0], rt[:, 1], s=100, color="#F44336", marker="*", zorder=5, label="target R")
 
-    stride = max(1, len(root_xy) // 12)
-    arrow_len = args.hip_y * 0.9
+    stride = max(1, len(root_xy) // 10)
     for i in range(0, len(root_xy), stride):
         yaw = root_yaw[i]
         start = root_xy[i]
-        delta = np.array([math.cos(yaw), math.sin(yaw)]) * arrow_len
+        delta = np.array([math.cos(yaw), math.sin(yaw)]) * args.hip_y * 0.8
         ax.arrow(
-            start[0],
-            start[1],
-            delta[0],
-            delta[1],
-            head_width=0.025,
-            head_length=0.035,
-            fc="black",
-            ec="black",
-            alpha=0.35,
+            start[0], start[1], delta[0], delta[1],
+            head_width=0.015, head_length=0.012, fc="green", ec="green", alpha=0.6,
             length_includes_head=True,
         )
 
@@ -170,15 +145,15 @@ def _plot(data: dict[str, np.ndarray | float], args: argparse.Namespace) -> None
     ax.set_xlabel("world x [m]")
     ax.set_ylabel("world y [m]")
     ax.set_title(
-        f"Yaw-only foothold plan: vx={args.vx:.2f}, vy={args.vy:.2f}, wz={args.wz:.2f} rad/s, "
-        f"blend={blend:.2f}, swing_horizon={t_swing:.2f}s"
+        f"LIPM Arc-Model: vx={args.vx:.2f}, vy={args.vy:.2f}, wz={args.wz:.2f} rad/s\n"
+        f"(per-foot v_eff = v_cmd + wz x hip_offset)"
     )
     ax.legend(loc="best", fontsize=8)
 
+    v_eff_mag = math.hypot(args.vx + args.wz * args.hip_y, args.vy)
     text = (
-        f"yaw special target = R(root_yaw + clamp(wz*horizon*gain, +/-max_delta)) * hip_offset\n"
-        f"gain={args.yaw_gain:.2f}, max_delta={args.max_delta:.2f} rad, "
-        f"wz*horizon={args.wz * t_swing:.2f} rad"
+        f"v_eff (left) = |v_cmd + wz*(-hip_y, 0)| = {v_eff_mag:.3f} m/s\n"
+        f"t_swing={data['t_swing']:.2f}s, yaw/step={args.wz * data['t_swing']:.2f} rad"
     )
     fig.text(0.06, 0.02, text, fontsize=9)
     fig.tight_layout(rect=(0, 0.05, 1, 1))
@@ -187,38 +162,31 @@ def _plot(data: dict[str, np.ndarray | float], args: argparse.Namespace) -> None
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=args.dpi)
     print(f"Wrote {out}")
-    print(f"blend={blend:.3f}, t_swing={t_swing:.3f}s, yaw_per_swing={args.wz * t_swing:.3f}rad")
-    print("step swing target_x target_y ideal_full_yaw_x ideal_full_yaw_y")
+
+    print(f"\nStep targets:")
     for i, foot in enumerate(swing):
-        foot_name = "L" if foot == 0 else "R"
-        print(
-            f"{i:02d}   {foot_name}   "
-            f"{target[i, 0]: .4f}  {target[i, 1]: .4f}   "
-            f"{ideal_landing[i, 0]: .4f}  {ideal_landing[i, 1]: .4f}"
-        )
+        name = "L" if foot == 0 else "R"
+        print(f"  {i:02d} ({name}): x={target[i, 0]:+.4f}  y={target[i, 1]:+.4f}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vx", type=float, default=0.0, help="Body/world x velocity used by this flat ideal plot.")
-    parser.add_argument("--vy", type=float, default=0.0, help="Body/world y velocity used by this flat ideal plot.")
-    parser.add_argument("--wz", type=float, default=1.0, help="Yaw-rate command [rad/s].")
-    parser.add_argument("--steps", type=int, default=16, help="Number of alternating swing-foot targets to draw.")
-    parser.add_argument("--t-step", type=float, default=0.6, help="Planner t_step from FootstepPlanCommandCfg.")
+    parser.add_argument("--vx", type=float, default=0.0)
+    parser.add_argument("--vy", type=float, default=0.0)
+    parser.add_argument("--wz", type=float, default=1.0)
+    parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--t-step", type=float, default=0.6)
     parser.add_argument("--t-swing-fraction", type=float, default=0.5)
     parser.add_argument("--hip-x", type=float, default=0.0)
     parser.add_argument("--hip-y", type=float, default=0.12)
-    parser.add_argument("--yaw-gain", type=float, default=0.50)
-    parser.add_argument("--max-delta", type=float, default=0.35)
-    parser.add_argument("--v-low", type=float, default=0.05)
-    parser.add_argument("--v-high", type=float, default=0.25)
-    parser.add_argument("--wz-deadband", type=float, default=0.15)
-    parser.add_argument("--wz-scale", type=float, default=0.60)
+    parser.add_argument("--com-height", type=float, default=0.78)
+    parser.add_argument("--step-width", type=float, default=0.24)
     parser.add_argument("--dpi", type=int, default=160)
     parser.add_argument("--out", type=str, default="scripts/debug/output/lipm_yaw_only_footholds.png")
     args = parser.parse_args()
 
-    data = _simulate(args)
+    lipm = _load_lipm()
+    data = _simulate(lipm, args)
     _plot(data, args)
     return 0
 
