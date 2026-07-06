@@ -1029,7 +1029,8 @@ def _configure_planner_lipm_paper_height_mlp_env(env_cfg) -> None:
     same stack as ``AME-G1-29DOF-HeightMLP-v0``, not DTCLite / not AME CNN.
 
     Rewards: ``footstep_landing_tracking`` (eq. 4-22) primary;
-    ``footstep_swing_tracking``=0.2 weakened; ``footstep_contact_phase``=0.1.
+    ``footstep_swing_tracking`` disabled for first-pass pipeline validation;
+    ``footstep_contact_phase``=0.1.
     """
     _configure_planner_lipm_env(env_cfg, use_placement_rewards=False)
     _configure_height_mlp_env(env_cfg)
@@ -1037,7 +1038,7 @@ def _configure_planner_lipm_paper_height_mlp_env(env_cfg) -> None:
     env_cfg.observations.critic = _PlannerLIPMPaperHeightMLPCriticCfg()
     r = env_cfg.rewards
     r.footstep_landing_tracking.weight = 1.0
-    r.footstep_swing_tracking.weight = 0.2
+    r.footstep_swing_tracking.weight = 0.0
     r.footstep_contact_phase.weight = 0.1
     r.footstep_placement_overlap.weight = 0.0
     r.foothold_penalty.weight = 0.0
