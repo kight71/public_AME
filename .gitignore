@@ -30,6 +30,7 @@ htmlcov/
 scripts/debug/*
 !scripts/debug/run_lipm_paper_mlp_smoke.sh
 !scripts/debug/run_lipm_paper_mlp_flat_smoke.sh
+!scripts/debug/run_lipm_paper_mlp_flat_omni_smoke.sh
 
 # Local docs / planning notes
 CLAUDE.md

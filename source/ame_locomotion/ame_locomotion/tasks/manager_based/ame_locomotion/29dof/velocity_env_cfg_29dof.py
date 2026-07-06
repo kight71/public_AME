@@ -1689,6 +1689,22 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT(G1RoughEnvCfg_DTC_PlannerV2
 
 
 @configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT):
+    """Flat-ground omni-command LIPM PaperMLP env.
+
+    Same terrain-free pipeline as ``PaperMLP_FLAT``, but opens the command
+    distribution to forward/backward, lateral, and yaw-rate motion.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.5, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+
+@configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
     """Play config for LIPM paper-reward MLP smoke / eval."""
 
