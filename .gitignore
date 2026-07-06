@@ -31,6 +31,8 @@ scripts/debug/*
 !scripts/debug/run_lipm_paper_mlp_smoke.sh
 !scripts/debug/run_lipm_paper_mlp_flat_smoke.sh
 !scripts/debug/run_lipm_paper_mlp_flat_omni_smoke.sh
+!scripts/debug/run_lipm_paper_mlp_flat_omni_play.sh
+!scripts/debug/plot_lipm_yaw_only_footholds.py
 
 # Local docs / planning notes
 CLAUDE.md

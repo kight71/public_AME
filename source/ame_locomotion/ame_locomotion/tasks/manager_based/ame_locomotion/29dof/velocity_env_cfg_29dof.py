@@ -1705,6 +1705,24 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI(G1RoughEnvCfg_DTC_Plan
 
 
 @configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI_PLAY(
+    G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI
+):
+    """Play/visualization config for flat-ground omni LIPM PaperMLP."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 16
+        self.scene.env_spacing = 2.5
+        self.episode_length_s = 40.0
+        self.observations.policy.enable_corruption = False
+        self.commands.base_velocity.debug_vis = False
+        self.commands.footstep_plan.debug_vis = True
+        self.commands.footstep_plan.selector_v2_debug_masks = False
+
+
+@configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
     """Play config for LIPM paper-reward MLP smoke / eval."""
 
