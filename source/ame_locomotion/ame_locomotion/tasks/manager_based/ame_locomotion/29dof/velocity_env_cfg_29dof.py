@@ -1647,6 +1647,47 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP(G1RoughEnvCfg_DTC_FORWARD):
 
 
 @configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP):
+    """Flat-ground LIPM PaperMLP smoke env for validating the planner/reward pipeline.
+
+    Keeps the exact LIPM + paper landing reward + HeightMLP observation stack,
+    but removes rough terrain, terrain curriculum, reset velocity noise, and
+    pushes. This is the first-pass check before running the same pipeline on
+    ``ROUGH_TERRAINS_CFG``.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+        self.scene.terrain.max_init_terrain_level = None
+        self.curriculum.terrain_levels = None
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        }
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
+        self.commands.base_velocity.ranges.lin_vel_x = (0.3, 0.6)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+
+
+@configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_PLAY(G1RoughEnvCfg_DTC_FORWARD_PLAY):
     """Play config for LIPM paper-reward MLP smoke / eval."""
 

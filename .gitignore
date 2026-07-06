@@ -29,6 +29,15 @@ venv/
 htmlcov/
 scripts/debug/*
 !scripts/debug/run_lipm_paper_mlp_smoke.sh
+!scripts/debug/run_lipm_paper_mlp_flat_smoke.sh
+
+# Local docs / planning notes
+CLAUDE.md
+PLAN.md
+README.md
+docs/superpowers/notes/
+docs/superpowers/plans/
+
 # Project artifacts
 logs/
 outputs/
