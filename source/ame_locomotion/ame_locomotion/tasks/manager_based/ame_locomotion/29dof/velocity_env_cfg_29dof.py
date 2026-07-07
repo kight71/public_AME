@@ -28,6 +28,8 @@ from ame_locomotion.tasks.manager_based.ame_locomotion.mdp.foot_geometry_constan
     G1_FOOT_LENGTH,
     G1_FOOT_N_LAT,
     G1_FOOT_N_LONG,
+    G1_FOOT_OFFSET_X,
+    G1_FOOT_OFFSET_Y,
     G1_FOOT_WIDTH,
     G1_SOLE_Z_OFFSET,
 )
@@ -857,6 +859,12 @@ def _configure_planner_v2_env(
     fp.use_selector_v2 = use_selector_v2
     fp.selector_v2_max_step_dz = 0.20
     fp.selector_v2_max_dz_omega = 0.10
+    fp.selector_v2_min_support_ratio = 0.0
+    fp.selector_v2_max_overhang_ratio = 1.0
+    fp.selector_v2_min_footprint_in_bounds_ratio = 0.0
+    fp.selector_v2_refine_to_tread_interior = False
+    fp.selector_v2_tread_height_epsilon = 0.02
+    fp.selector_v2_tread_margin = 0.0
     fp.selector_v2_w_terrain = 1.0
     fp.selector_v2_w_nominal = 0.5
     fp.selector_v2_w_reach = 1.0
@@ -1693,6 +1701,10 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_TERRAIN_WINDOW(
 
         self.commands.footstep_plan.selector_v2_candidate_mode = "terrain_window"
         self.commands.footstep_plan.selector_v2_terrain_half_width_cells = 4
+        self.commands.footstep_plan.selector_v2_max_overhang_ratio = 0.0
+        self.commands.footstep_plan.selector_v2_min_footprint_in_bounds_ratio = 1.0
+        self.commands.footstep_plan.selector_v2_refine_to_tread_interior = True
+        self.commands.footstep_plan.selector_v2_tread_margin = 0.06
         _apply_footstep_double_support(self, t_double_support=0.05, landing_window=0.15)
 
 
@@ -2382,6 +2394,8 @@ _BEAMDOJO_FOOTHOLD_PARAMS = {
     "foot_width": G1_FOOT_WIDTH,
     "n_long": G1_FOOT_N_LONG,
     "n_lat": G1_FOOT_N_LAT,
+    "foot_offset_x": G1_FOOT_OFFSET_X,
+    "foot_offset_y": G1_FOOT_OFFSET_Y,
     "force_threshold": 1.0,
     "sole_z_offset": G1_SOLE_Z_OFFSET,
 }

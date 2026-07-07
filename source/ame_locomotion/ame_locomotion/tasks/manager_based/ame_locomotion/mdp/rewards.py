@@ -14,6 +14,8 @@ from .foot_geometry_constants import (
     G1_FOOT_LENGTH,
     G1_FOOT_N_LAT,
     G1_FOOT_N_LONG,
+    G1_FOOT_OFFSET_X,
+    G1_FOOT_OFFSET_Y,
     G1_FOOT_WIDTH,
     G1_SOLE_Z_OFFSET,
 )
@@ -737,6 +739,8 @@ def feet_ground_parallel(
     foot_width: float = G1_FOOT_WIDTH,
     n_long: int = G1_FOOT_N_LONG,
     n_lat: int = G1_FOOT_N_LAT,
+    foot_offset_x: float = G1_FOOT_OFFSET_X,
+    foot_offset_y: float = G1_FOOT_OFFSET_Y,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
 ) -> torch.Tensor:
@@ -750,6 +754,8 @@ def feet_ground_parallel(
         foot_width=foot_width,
         n_long=n_long,
         n_lat=n_lat,
+        foot_offset_x=foot_offset_x,
+        foot_offset_y=foot_offset_y,
         force_threshold=force_threshold,
         sole_z_offset=sole_z_offset,
     )
@@ -772,10 +778,9 @@ def feet_ground_parallel(
 #
 # This is feedback-style: evaluates actual foot placement quality rather
 # than asking the policy to track a planner-supplied target. We use a
-# rectangular sampling grid. The sole offset comes from Unitree G1
-# ankle_roll_link STL bounds:
-#   /home/tan/unitree_mujoco/unitree_robots/g1/meshes/*_ankle_roll_link.STL
-#   bounds min_z = -0.035409145 m, x extent = 0.2082 m, y extent = 0.0756 m.
+# rectangular sampling grid. The footprint matches the stock Unitree G1 USD
+# ankle_roll_link collider union in link frame: x=[-0.055, 0.145],
+# y=[-0.035, 0.035], i.e. a forward-shifted 0.20 m × 0.07 m patch.
 # =========================================================================
 
 
@@ -788,6 +793,8 @@ def _foothold_sample_geometry(
     foot_width: float,
     n_long: int,
     n_lat: int,
+    foot_offset_x: float,
+    foot_offset_y: float,
     force_threshold: float,
     sole_z_offset: float,
     support_threshold: float = 0.03,
@@ -832,8 +839,8 @@ def _foothold_sample_geometry(
     s = torch.sin(yaw)
 
     device = foot_pos_w.device
-    xs = torch.linspace(-foot_length * 0.5, foot_length * 0.5, n_long, device=device)
-    ys = torch.linspace(-foot_width * 0.5, foot_width * 0.5, n_lat, device=device)
+    xs = torch.linspace(-foot_length * 0.5, foot_length * 0.5, n_long, device=device) + foot_offset_x
+    ys = torch.linspace(-foot_width * 0.5, foot_width * 0.5, n_lat, device=device) + foot_offset_y
     gx, gy = torch.meshgrid(xs, ys, indexing="ij")
     grid_b = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)
     n_samples = grid_b.shape[0]
@@ -879,6 +886,8 @@ def foothold_sampling(
     foot_width: float = G1_FOOT_WIDTH,
     n_long: int = G1_FOOT_N_LONG,
     n_lat: int = G1_FOOT_N_LAT,
+    foot_offset_x: float = G1_FOOT_OFFSET_X,
+    foot_offset_y: float = G1_FOOT_OFFSET_Y,
     support_threshold: float = 0.03,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
@@ -893,6 +902,8 @@ def foothold_sampling(
         foot_width=foot_width,
         n_long=n_long,
         n_lat=n_lat,
+        foot_offset_x=foot_offset_x,
+        foot_offset_y=foot_offset_y,
         force_threshold=force_threshold,
         sole_z_offset=sole_z_offset,
         support_threshold=support_threshold,
@@ -923,6 +934,8 @@ def foothold_penalty(
     foot_width: float = G1_FOOT_WIDTH,
     n_long: int = G1_FOOT_N_LONG,
     n_lat: int = G1_FOOT_N_LAT,
+    foot_offset_x: float = G1_FOOT_OFFSET_X,
+    foot_offset_y: float = G1_FOOT_OFFSET_Y,
     support_threshold: float = 0.03,
     force_threshold: float = 1.0,
     sole_z_offset: float = G1_ANKLE_ROLL_MESH_MIN_Z,
@@ -945,6 +958,8 @@ def foothold_penalty(
         foot_width=foot_width,
         n_long=n_long,
         n_lat=n_lat,
+        foot_offset_x=foot_offset_x,
+        foot_offset_y=foot_offset_y,
         force_threshold=force_threshold,
         sole_z_offset=sole_z_offset,
         support_threshold=support_threshold,

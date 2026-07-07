@@ -208,6 +208,24 @@ def test_zero_offsets_matches_ray_hit(fg):
     assert out["z_median"].item() == pytest.approx(expected_z, abs=1e-5)
 
 
+def test_foot_offset_moves_sample_grid(fg):
+    rays = _regular_rays()
+    centers = torch.zeros(1, 1, 3)
+    yaws = torch.zeros(1, 1)
+    out = fg.foot_patch_stats(
+        centers, yaws, rays,
+        foot_length=0.20, foot_width=0.07, n_long=2, n_lat=2,
+        support_threshold=0.03,
+        foot_offset_x=0.045,
+        foot_offset_y=0.0,
+        return_debug=True,
+        **_grid_kwargs(),
+    )
+    sample_x = out["sample_xy_w"][0, 0, :, 0]
+    assert sample_x.min().item() == pytest.approx(-0.055, abs=1e-6)
+    assert sample_x.max().item() == pytest.approx(0.145, abs=1e-6)
+
+
 def test_grid_path_required_when_many_candidates(fg):
     rays = _regular_rays(batch=1)
     centers = torch.zeros(1, 3, 3)

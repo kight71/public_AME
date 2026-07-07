@@ -506,9 +506,11 @@ def test_v2_score_zero_on_fallback(fs):
     assert torch.all(out["per_cost_debug"] == 0.0)
 
 
-def test_v2_prefers_flat_over_edge(fs):
+def test_v2_g1_offset_prefers_single_tread_over_flat_edge(fs):
     def step(x, y):
-        # Step at x=0.05 so flat-side candidates sit fully on z=0, raised side on z=0.15.
+        # With the G1 ankle-roll footprint offset, a nominal at x=0.0 would put
+        # the toe over the riser. The selector should prefer a single-tread
+        # raised candidate instead of a flat-side edge placement.
         return (x >= 0.05).float() * 0.15
 
     rays, shp = _v2_rays(h=21, w=21, z_fn=step)
@@ -525,7 +527,8 @@ def test_v2_prefers_flat_over_edge(fs):
         **_v2_defaults(shp),
     )
     sel_x = out["selected_xyz_w"][0, 0, 0].item()
-    assert sel_x < -0.02, f"expected flat-side cell (x<0), got x={sel_x:.3f}"
+    assert sel_x >= 0.05, f"expected raised-side single-tread cell, got x={sel_x:.3f}"
+    assert out["selected_xyz_w"][0, 0, 2].item() == pytest.approx(0.15 - fs.G1_SOLE_Z_OFFSET, abs=1e-5)
     assert not out["used_fallback"][0, 0].item()
 
 
@@ -604,9 +607,103 @@ def test_v2_mask_debug_returned_when_requested(fs):
         "reach_valid_count",
         "step_height_valid_count",
         "roughness_valid_count",
+        "support_valid_count",
+        "overhang_valid_count",
+        "footprint_valid_count",
+        "surface_valid_count",
         "in_bounds_valid_count",
         "combined_valid_count",
     }
+
+
+def test_v2_max_overhang_rejects_footprint_crossing_lower_tread(fs):
+    def step(x, y):
+        return (x >= 0.05).float() * 0.15
+
+    rays, shp = _v2_rays(h=21, w=21, res=0.05, z_fn=step)
+    kw = _v2_defaults(shp, 0.05)
+    candidates = torch.tensor(
+        [
+            [
+                # Edge candidates: the G1-offset footprint spans the lower and upper treads.
+                [[0.05, 0.12, 0.15], [0.15, 0.12, 0.15]],
+                [[0.05, -0.12, 0.15], [0.15, -0.12, 0.15]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.ones(1, 2, 2, dtype=torch.bool)
+    nominal = candidates[:, :, 0].clone()
+
+    out_legacy = fs.score_foothold_candidates_v2(
+        nominal,
+        candidates,
+        mask,
+        rays,
+        w_nominal=5.0,
+        w_reach=0.0,
+        w_height=0.0,
+        w_terrain=0.0,
+        w_edge=0.0,
+        w_slope=0.0,
+        max_dz_omega=0.20,
+        **kw,
+    )
+    assert out_legacy["selected_xyz_w"][0, 0, 0].item() == pytest.approx(0.05, abs=1e-5)
+
+    out_safe = fs.score_foothold_candidates_v2(
+        nominal,
+        candidates,
+        mask,
+        rays,
+        w_nominal=5.0,
+        w_reach=0.0,
+        w_height=0.0,
+        w_terrain=0.0,
+        w_edge=0.0,
+        w_slope=0.0,
+        max_dz_omega=0.20,
+        max_overhang_ratio=0.0,
+        **kw,
+    )
+    assert not out_safe["used_fallback"][0, 0].item()
+    assert out_safe["selected_xyz_w"][0, 0, 0].item() == pytest.approx(0.15, abs=1e-5)
+
+
+def test_v2_refine_to_tread_interior_nudges_edge_candidate(fs):
+    def step(x, y):
+        return (x >= 0.05).float() * 0.15
+
+    rays, shp = _v2_rays(h=21, w=21, res=0.05, z_fn=step)
+    kw = _v2_defaults(shp, 0.05)
+    candidates = torch.tensor(
+        [
+            [
+                [[0.05, 0.12, 0.15]],
+                [[0.05, -0.12, 0.15]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.ones(1, 2, 1, dtype=torch.bool)
+    nominal = candidates[:, :, 0].clone()
+
+    out = fs.score_foothold_candidates_v2(
+        nominal,
+        candidates,
+        mask,
+        rays,
+        max_dz_omega=0.20,
+        max_overhang_ratio=0.0,
+        refine_to_tread_interior=True,
+        tread_margin=0.03,
+        **kw,
+    )
+
+    assert not out["used_fallback"][0, 0].item()
+    # The original candidate center x=0.05 would put part of the foot on x<0.
+    # Refinement clamps it inside the same-height tread with a margin.
+    assert out["selected_xyz_w"][0, 0, 0].item() > 0.09
 
 
 def test_v2_flat_mask_counts_match_five_by_five_reach_band(fs):

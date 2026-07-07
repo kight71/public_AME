@@ -14,6 +14,8 @@ def _foot_sample_offsets_body(
     foot_width: float,
     n_long: int,
     n_lat: int,
+    foot_offset_x: float = 0.0,
+    foot_offset_y: float = 0.0,
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -22,6 +24,8 @@ def _foot_sample_offsets_body(
         raise ValueError("n_long and n_lat must be positive.")
     xs = torch.linspace(-foot_length * 0.5, foot_length * 0.5, n_long, device=device, dtype=dtype)
     ys = torch.linspace(-foot_width * 0.5, foot_width * 0.5, n_lat, device=device, dtype=dtype)
+    xs = xs + torch.as_tensor(foot_offset_x, device=device, dtype=dtype)
+    ys = ys + torch.as_tensor(foot_offset_y, device=device, dtype=dtype)
     gx, gy = torch.meshgrid(xs, ys, indexing="ij")
     return torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)
 
@@ -133,6 +137,8 @@ def foot_patch_stats(
     n_long: int,
     n_lat: int,
     support_threshold: float,
+    foot_offset_x: float = 0.0,
+    foot_offset_y: float = 0.0,
     grid_shape: tuple[int, int] | None = None,
     grid_resolution: float | None = None,
     grid_center_w: torch.Tensor | None = None,
@@ -159,6 +165,8 @@ def foot_patch_stats(
         foot_width,
         n_long,
         n_lat,
+        foot_offset_x,
+        foot_offset_y,
         device=centers_w.device,
         dtype=centers_w.dtype,
     )

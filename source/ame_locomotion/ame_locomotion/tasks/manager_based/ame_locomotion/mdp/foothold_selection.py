@@ -42,9 +42,12 @@ from .foot_geometry_constants import (
     G1_FOOT_LENGTH,
     G1_FOOT_N_LAT,
     G1_FOOT_N_LONG,
+    G1_FOOT_OFFSET_X,
+    G1_FOOT_OFFSET_Y,
     G1_FOOT_WIDTH,
     G1_SOLE_Z_OFFSET,
 )
+from .gridmap_utils import world_xy_to_grid_float
 from .planner import _yaw_rotation
 
 __all__ = [
@@ -269,6 +272,8 @@ def foothold_quality_at_centers(
     foot_width: float = G1_FOOT_WIDTH,
     n_long: int = G1_FOOT_N_LONG,
     n_lat: int = G1_FOOT_N_LAT,
+    foot_offset_x: float = G1_FOOT_OFFSET_X,
+    foot_offset_y: float = G1_FOOT_OFFSET_Y,
     support_threshold: float = 0.03,
 ) -> torch.Tensor:
     """Task 0.5 quality score for committed foot-body centers: ``support × exp(-0.5(slope/σ)²)``."""
@@ -282,6 +287,8 @@ def foothold_quality_at_centers(
         foot_width=foot_width,
         n_long=n_long,
         n_lat=n_lat,
+        foot_offset_x=foot_offset_x,
+        foot_offset_y=foot_offset_y,
         support_threshold=support_threshold,
         grid_shape=grid_shape,
         grid_resolution=grid_resolution,
@@ -299,6 +306,96 @@ def _nearest_ray_xyz(xy_w: torch.Tensor, ray_hits_w: torch.Tensor) -> torch.Tens
     hit_idx = d2.argmin(dim=-1)
     b_idx = torch.arange(ray_hits_w.shape[0], device=ray_hits_w.device).view(-1, 1).expand_as(hit_idx)
     return ray_hits_w[b_idx, hit_idx]
+
+
+def _refine_to_tread_interior(
+    candidate_terrain_xyz_w: torch.Tensor,
+    ray_hits_w: torch.Tensor,
+    *,
+    grid_shape: tuple[int, int],
+    grid_resolution: float,
+    grid_center_w: torch.Tensor,
+    grid_yaw: torch.Tensor,
+    foot_length: float,
+    foot_width: float,
+    foot_offset_x: float,
+    foot_offset_y: float,
+    height_epsilon: float,
+    margin: float,
+) -> torch.Tensor:
+    """Clamp candidate xy into the interior of its same-height grid-cell run.
+
+    The terrain-window selector generates candidates at grid-cell centers. On
+    stairs, a good nominal can sit just outside a safe tread interval because the
+    grid is coarse. This refinement keeps the candidate on the same quantized
+    height plateau, but nudges its center away from detected height transitions
+    so a yaw-aligned foot rectangle can fit inside that plateau.
+    """
+    b, num_feet, num_candidates, _ = candidate_terrain_xyz_w.shape
+    height, width = grid_shape
+    device = candidate_terrain_xyz_w.device
+    dtype = candidate_terrain_xyz_w.dtype
+
+    flat = candidate_terrain_xyz_w.reshape(b, num_feet * num_candidates, 3)
+    grid_float = world_xy_to_grid_float(
+        flat[..., :2],
+        grid_center_w,
+        grid_yaw,
+        grid_shape=grid_shape,
+        grid_resolution=grid_resolution,
+    )
+    row = torch.round(grid_float[..., 0]).long().clamp(0, height - 1)
+    col = torch.round(grid_float[..., 1]).long().clamp(0, width - 1)
+
+    z_grid = ray_hits_w[..., 2].reshape(b, height, width)
+    b_idx = torch.arange(b, device=device).view(b, 1).expand_as(row)
+    z_sel = z_grid[b_idx, row, col]
+
+    col_idx = torch.arange(width, device=device).view(1, 1, width)
+    row_idx = torch.arange(height, device=device).view(1, 1, height)
+
+    z_rows = z_grid[b_idx, row]  # (B, M, W)
+    same_cols = (z_rows - z_sel.unsqueeze(-1)).abs() <= height_epsilon
+    not_same_left = (~same_cols) & (col_idx < col.unsqueeze(-1))
+    not_same_right = (~same_cols) & (col_idx > col.unsqueeze(-1))
+    last_left_blocker = torch.where(not_same_left, col_idx, torch.full_like(col_idx, -1)).max(dim=-1).values
+    first_right_blocker = torch.where(not_same_right, col_idx, torch.full_like(col_idx, width)).min(dim=-1).values
+    left_col = last_left_blocker + 1
+    right_col = first_right_blocker - 1
+
+    z_cols = z_grid.permute(0, 2, 1)[b_idx, col]  # (B, M, H)
+    same_rows = (z_cols - z_sel.unsqueeze(-1)).abs() <= height_epsilon
+    not_same_down = (~same_rows) & (row_idx < row.unsqueeze(-1))
+    not_same_up = (~same_rows) & (row_idx > row.unsqueeze(-1))
+    last_down_blocker = torch.where(not_same_down, row_idx, torch.full_like(row_idx, -1)).max(dim=-1).values
+    first_up_blocker = torch.where(not_same_up, row_idx, torch.full_like(row_idx, height)).min(dim=-1).values
+    down_row = last_down_blocker + 1
+    up_row = first_up_blocker - 1
+
+    center_col = torch.tensor((width - 1) * 0.5, device=device, dtype=dtype)
+    center_row = torch.tensor((height - 1) * 0.5, device=device, dtype=dtype)
+    half_l = 0.5 * foot_length + margin
+    half_w = 0.5 * foot_width + margin
+
+    x_min = (left_col.to(dtype) - 0.5 - center_col) * grid_resolution + half_l - foot_offset_x
+    x_max = (right_col.to(dtype) + 0.5 - center_col) * grid_resolution - half_l - foot_offset_x
+    y_min = (down_row.to(dtype) - 0.5 - center_row) * grid_resolution + half_w - foot_offset_y
+    y_max = (up_row.to(dtype) + 0.5 - center_row) * grid_resolution - half_w - foot_offset_y
+
+    local_x = (grid_float[..., 1] - center_col) * grid_resolution
+    local_y = (grid_float[..., 0] - center_row) * grid_resolution
+    x_mid = 0.5 * (x_min + x_max)
+    y_mid = 0.5 * (y_min + y_max)
+    local_x = torch.where(x_min <= x_max, local_x.clamp(min=x_min, max=x_max), x_mid)
+    local_y = torch.where(y_min <= y_max, local_y.clamp(min=y_min, max=y_max), y_mid)
+
+    yaw = grid_yaw.view(b, 1)
+    c = torch.cos(yaw)
+    s = torch.sin(yaw)
+    out = flat.clone()
+    out[..., 0] = grid_center_w[:, 0:1] + c * local_x - s * local_y
+    out[..., 1] = grid_center_w[:, 1:2] + s * local_x + c * local_y
+    return out.reshape_as(candidate_terrain_xyz_w)
 
 
 def _under_hip_fallback_w(
@@ -343,10 +440,12 @@ def score_foothold_candidates_v2(
     grid_resolution: float,
     grid_center_w: torch.Tensor,
     grid_yaw: torch.Tensor,
-    foot_length: float = 0.18,
-    foot_width: float = 0.065,
-    n_long: int = 4,
-    n_lat: int = 3,
+    foot_length: float = G1_FOOT_LENGTH,
+    foot_width: float = G1_FOOT_WIDTH,
+    n_long: int = G1_FOOT_N_LONG,
+    n_lat: int = G1_FOOT_N_LAT,
+    foot_offset_x: float = G1_FOOT_OFFSET_X,
+    foot_offset_y: float = G1_FOOT_OFFSET_Y,
     support_threshold: float = 0.03,
     sole_z_offset: float = G1_SOLE_Z_OFFSET,
     reach_x_range: tuple[float, float] = (-0.12, 0.35),
@@ -354,6 +453,12 @@ def score_foothold_candidates_v2(
     reach_y_range_right: tuple[float, float] = (-0.28, -0.06),
     max_step_dz: float = 0.20,
     max_dz_omega: float = 0.10,
+    min_support_ratio: float = 0.0,
+    max_overhang_ratio: float = 1.0,
+    min_footprint_in_bounds_ratio: float = 0.0,
+    refine_to_tread_interior: bool = False,
+    tread_height_epsilon: float = 0.02,
+    tread_margin: float = 0.0,
     w_terrain: float = 1.0,
     w_nominal: float = 0.5,
     w_reach: float = 1.0,
@@ -410,6 +515,21 @@ def score_foothold_candidates_v2(
         raise ValueError("candidate_terrain_xyz_w must contain at least one candidate.")
 
     valid_candidates = candidate_mask.bool()
+    if refine_to_tread_interior:
+        candidate_terrain_xyz_w = _refine_to_tread_interior(
+            candidate_terrain_xyz_w,
+            ray_hits_w,
+            grid_shape=grid_shape,
+            grid_resolution=grid_resolution,
+            grid_center_w=grid_center_w,
+            grid_yaw=grid_yaw,
+            foot_length=foot_length,
+            foot_width=foot_width,
+            foot_offset_x=foot_offset_x,
+            foot_offset_y=foot_offset_y,
+            height_epsilon=tread_height_epsilon,
+            margin=tread_margin,
+        )
     candidates_fb = candidate_terrain_xyz_w.clone()
     candidates_fb[..., 2] = candidate_terrain_xyz_w[..., 2] - sole_z_offset
 
@@ -423,6 +543,8 @@ def score_foothold_candidates_v2(
         foot_width=foot_width,
         n_long=n_long,
         n_lat=n_lat,
+        foot_offset_x=foot_offset_x,
+        foot_offset_y=foot_offset_y,
         support_threshold=support_threshold,
         grid_shape=grid_shape,
         grid_resolution=grid_resolution,
@@ -438,6 +560,7 @@ def score_foothold_candidates_v2(
     overhang_ratio = _reshape(stats["overhang_ratio"])
     slope_angle = _reshape(stats["slope_angle"])
     z_q70 = _reshape(stats["z_q70"])
+    footprint_in_bounds_ratio = _reshape(stats["footprint_in_bounds_ratio"])
 
     reach_valid = reachability_mask(
         candidates_fb,
@@ -451,7 +574,11 @@ def score_foothold_candidates_v2(
         candidates_fb, stance_terrain_z_w, max_dz=max_step_dz, sole_z_offset=sole_z_offset
     )
     rough_valid = roughness_cap_mask(dz_omega, max_dz_omega=max_dz_omega)
-    valid = reach_valid & height_valid & rough_valid & valid_candidates
+    support_valid = support_ratio >= min_support_ratio
+    overhang_valid = overhang_ratio <= max_overhang_ratio
+    footprint_valid = footprint_in_bounds_ratio >= min_footprint_in_bounds_ratio
+    surface_valid = support_valid & overhang_valid & footprint_valid
+    valid = reach_valid & height_valid & rough_valid & surface_valid & valid_candidates
     valid_count = valid.sum(dim=-1).long()
     used_fallback = valid_count == 0
 
@@ -519,6 +646,10 @@ def score_foothold_candidates_v2(
             "reach_valid_count": reach_valid.sum(dim=-1),
             "step_height_valid_count": height_valid.sum(dim=-1),
             "roughness_valid_count": rough_valid.sum(dim=-1),
+            "support_valid_count": support_valid.sum(dim=-1),
+            "overhang_valid_count": overhang_valid.sum(dim=-1),
+            "footprint_valid_count": footprint_valid.sum(dim=-1),
+            "surface_valid_count": surface_valid.sum(dim=-1),
             "in_bounds_valid_count": valid_candidates.sum(dim=-1),
             "combined_valid_count": valid_count,
         }
@@ -538,10 +669,12 @@ def select_foothold_v2(
     grid_center_w: torch.Tensor,
     grid_yaw: torch.Tensor,
     half_width_cells: int = 2,
-    foot_length: float = 0.18,
-    foot_width: float = 0.065,
-    n_long: int = 4,
-    n_lat: int = 3,
+    foot_length: float = G1_FOOT_LENGTH,
+    foot_width: float = G1_FOOT_WIDTH,
+    n_long: int = G1_FOOT_N_LONG,
+    n_lat: int = G1_FOOT_N_LAT,
+    foot_offset_x: float = G1_FOOT_OFFSET_X,
+    foot_offset_y: float = G1_FOOT_OFFSET_Y,
     support_threshold: float = 0.03,
     sole_z_offset: float = G1_SOLE_Z_OFFSET,
     reach_x_range: tuple[float, float] = (-0.12, 0.35),
@@ -549,6 +682,12 @@ def select_foothold_v2(
     reach_y_range_right: tuple[float, float] = (-0.28, -0.06),
     max_step_dz: float = 0.20,
     max_dz_omega: float = 0.10,
+    min_support_ratio: float = 0.0,
+    max_overhang_ratio: float = 1.0,
+    min_footprint_in_bounds_ratio: float = 0.0,
+    refine_to_tread_interior: bool = False,
+    tread_height_epsilon: float = 0.02,
+    tread_margin: float = 0.0,
     w_terrain: float = 1.0,
     w_nominal: float = 0.5,
     w_reach: float = 1.0,
@@ -608,6 +747,8 @@ def select_foothold_v2(
         foot_width=foot_width,
         n_long=n_long,
         n_lat=n_lat,
+        foot_offset_x=foot_offset_x,
+        foot_offset_y=foot_offset_y,
         support_threshold=support_threshold,
         sole_z_offset=sole_z_offset,
         reach_x_range=reach_x_range,
@@ -615,6 +756,12 @@ def select_foothold_v2(
         reach_y_range_right=reach_y_range_right,
         max_step_dz=max_step_dz,
         max_dz_omega=max_dz_omega,
+        min_support_ratio=min_support_ratio,
+        max_overhang_ratio=max_overhang_ratio,
+        min_footprint_in_bounds_ratio=min_footprint_in_bounds_ratio,
+        refine_to_tread_interior=refine_to_tread_interior,
+        tread_height_epsilon=tread_height_epsilon,
+        tread_margin=tread_margin,
         w_terrain=w_terrain,
         w_nominal=w_nominal,
         w_reach=w_reach,

@@ -179,6 +179,10 @@ class FootstepPlanCommand(CommandTerm):
         self.mask_reach_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
         self.mask_step_height_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
         self.mask_roughness_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_support_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_overhang_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_footprint_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
+        self.mask_surface_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
         self.mask_in_bounds_valid_buffer = torch.zeros(B, N, 2, dtype=torch.long, device=self.device)
 
         # ---- phantom (virtual reference body) ---------------------------
@@ -214,6 +218,10 @@ class FootstepPlanCommand(CommandTerm):
         self.metrics["selector_v2_mask_reach_valid"] = torch.zeros(B, device=self.device)
         self.metrics["selector_v2_mask_step_height_valid"] = torch.zeros(B, device=self.device)
         self.metrics["selector_v2_mask_roughness_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_support_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_overhang_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_footprint_valid"] = torch.zeros(B, device=self.device)
+        self.metrics["selector_v2_mask_surface_valid"] = torch.zeros(B, device=self.device)
         self.metrics["selector_v2_mask_in_bounds_valid"] = torch.zeros(B, device=self.device)
         self.metrics["selector_v2_mask_roughness_valid_L"] = torch.zeros(B, device=self.device)
         self.metrics["selector_v2_mask_roughness_valid_R"] = torch.zeros(B, device=self.device)
@@ -246,10 +254,18 @@ class FootstepPlanCommand(CommandTerm):
             k0_reach = self.mask_reach_valid_buffer[:, 0].float()
             k0_step_h = self.mask_step_height_valid_buffer[:, 0].float()
             k0_rough = self.mask_roughness_valid_buffer[:, 0].float()
+            k0_support = self.mask_support_valid_buffer[:, 0].float()
+            k0_overhang = self.mask_overhang_valid_buffer[:, 0].float()
+            k0_footprint = self.mask_footprint_valid_buffer[:, 0].float()
+            k0_surface = self.mask_surface_valid_buffer[:, 0].float()
             k0_bounds = self.mask_in_bounds_valid_buffer[:, 0].float()
             self.metrics["selector_v2_mask_reach_valid"][:] = k0_reach.mean(dim=-1)
             self.metrics["selector_v2_mask_step_height_valid"][:] = k0_step_h.mean(dim=-1)
             self.metrics["selector_v2_mask_roughness_valid"][:] = k0_rough.mean(dim=-1)
+            self.metrics["selector_v2_mask_support_valid"][:] = k0_support.mean(dim=-1)
+            self.metrics["selector_v2_mask_overhang_valid"][:] = k0_overhang.mean(dim=-1)
+            self.metrics["selector_v2_mask_footprint_valid"][:] = k0_footprint.mean(dim=-1)
+            self.metrics["selector_v2_mask_surface_valid"][:] = k0_surface.mean(dim=-1)
             self.metrics["selector_v2_mask_in_bounds_valid"][:] = k0_bounds.mean(dim=-1)
             self.metrics["selector_v2_mask_roughness_valid_L"][:] = k0_rough[:, 0]
             self.metrics["selector_v2_mask_roughness_valid_R"][:] = k0_rough[:, 1]
@@ -916,6 +932,10 @@ class FootstepPlanCommand(CommandTerm):
                 ("reach", "reach_valid_count"),
                 ("step_height", "step_height_valid_count"),
                 ("roughness", "roughness_valid_count"),
+                ("support", "support_valid_count"),
+                ("overhang", "overhang_valid_count"),
+                ("footprint", "footprint_valid_count"),
+                ("surface", "surface_valid_count"),
                 ("in_bounds", "in_bounds_valid_count"),
                 ("combined", "combined_valid_count"),
             )
@@ -1051,6 +1071,12 @@ class FootstepPlanCommand(CommandTerm):
                 grid_yaw=grid_yaw,
                 max_step_dz=self.cfg.selector_v2_max_step_dz,
                 max_dz_omega=self.cfg.selector_v2_max_dz_omega,
+                min_support_ratio=self.cfg.selector_v2_min_support_ratio,
+                max_overhang_ratio=self.cfg.selector_v2_max_overhang_ratio,
+                min_footprint_in_bounds_ratio=self.cfg.selector_v2_min_footprint_in_bounds_ratio,
+                refine_to_tread_interior=self.cfg.selector_v2_refine_to_tread_interior,
+                tread_height_epsilon=self.cfg.selector_v2_tread_height_epsilon,
+                tread_margin=self.cfg.selector_v2_tread_margin,
                 w_terrain=self.cfg.selector_v2_w_terrain,
                 w_nominal=self.cfg.selector_v2_w_nominal,
                 w_reach=self.cfg.selector_v2_w_reach,
@@ -1069,6 +1095,10 @@ class FootstepPlanCommand(CommandTerm):
                 self.mask_reach_valid_buffer[env_ids, k] = md["reach_valid_count"]
                 self.mask_step_height_valid_buffer[env_ids, k] = md["step_height_valid_count"]
                 self.mask_roughness_valid_buffer[env_ids, k] = md["roughness_valid_count"]
+                self.mask_support_valid_buffer[env_ids, k] = md["support_valid_count"]
+                self.mask_overhang_valid_buffer[env_ids, k] = md["overhang_valid_count"]
+                self.mask_footprint_valid_buffer[env_ids, k] = md["footprint_valid_count"]
+                self.mask_surface_valid_buffer[env_ids, k] = md["surface_valid_count"]
                 self.mask_in_bounds_valid_buffer[env_ids, k] = md["in_bounds_valid_count"]
 
             if debug_masks:
@@ -1328,6 +1358,26 @@ class FootstepPlanCommandCfg(CommandTermCfg):
 
     selector_v2_max_step_dz: float = 0.20
     selector_v2_max_dz_omega: float = 0.10
+    selector_v2_min_support_ratio: float = 0.0
+    """Hard gate on footprint support ratio. 0 keeps legacy behavior."""
+
+    selector_v2_max_overhang_ratio: float = 1.0
+    """Hard gate on lower-surface footprint samples. 1 keeps legacy behavior;
+    use 0.0 for straight stair walking to forbid crossing a lower tread edge."""
+
+    selector_v2_min_footprint_in_bounds_ratio: float = 0.0
+    """Hard gate on footprint samples inside the height grid. 0 keeps legacy behavior."""
+
+    selector_v2_refine_to_tread_interior: bool = False
+    """When True, nudge terrain-window candidates into same-height tread interiors
+    before scoring. Useful for straight stair walking with coarse height grids."""
+
+    selector_v2_tread_height_epsilon: float = 0.02
+    """Height tolerance used to identify same-height tread cells during refinement."""
+
+    selector_v2_tread_margin: float = 0.0
+    """Extra xy margin added around the foot rectangle during tread refinement."""
+
     selector_v2_w_terrain: float = 1.0
     selector_v2_w_nominal: float = 0.5
     selector_v2_w_reach: float = 1.0
