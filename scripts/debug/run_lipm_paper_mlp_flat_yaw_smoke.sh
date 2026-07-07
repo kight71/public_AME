@@ -10,7 +10,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PY="${PY:-$ROOT/.AME/bin/python}"
+# Override: PY=/path/to/python  or  CONDA_ENV=/path/to/env
+CONDA_ENV="${CONDA_ENV:-/root/autodl-tmp/conda_envs/AME}"
+PY="${PY:-$CONDA_ENV/bin/python}"
+if [[ ! -x "$PY" ]]; then
+  PY="$ROOT/.AME/bin/python"
+fi
 if [[ ! -x "$PY" ]]; then
   PY=python
 fi

@@ -931,15 +931,33 @@ class _PlannerLIPMCriticCfg(ObsGroup):
     )
 
 
+def _apply_footstep_double_support(
+    env_cfg,
+    *,
+    t_double_support: float,
+    landing_window: float | None = None,
+) -> None:
+    """Enable four-phase gait: L_swing | DS_1 | R_swing | DS_2.
+
+    Requires ``0 < 2 * t_double_support < t_step`` (validated in ``FootstepPlanCommand``).
+    """
+    env_cfg.commands.footstep_plan.t_double_support = t_double_support
+    if landing_window is not None:
+        env_cfg.rewards.footstep_landing_tracking.params["landing_window"] = landing_window
+
+
 def _configure_planner_lipm_env(
     env_cfg,
     *,
     use_placement_rewards: bool = False,
+    t_double_support: float = 0.0,
 ) -> None:
     """LIPM prior + v2 selector; no phantom; swing tracking + phase obs enabled.
 
     Flat-ground LIPM nominal (thesis eq. 4-5–4-11) + ``select_foothold_v2`` terrain
     projection. Does **not** implement stair tread sequencing (eq. 4-12–4-17).
+
+    Set ``t_double_support > 0`` to use the four-phase gait clock (L_swing | DS | R_swing | DS).
     """
     _configure_planner_v2_env(
         env_cfg,
@@ -951,6 +969,8 @@ def _configure_planner_lipm_env(
     fp.use_phantom = False
     fp.raibert_factor = 0.0
     fp.n_future_steps = 1
+    if t_double_support > 0.0:
+        _apply_footstep_double_support(env_cfg, t_double_support=t_double_support)
     env_cfg.rewards.footstep_swing_tracking.weight = 1.0
     env_cfg.observations.policy = _PlannerLIPMPolicyCfg()
     env_cfg.observations.critic = _PlannerLIPMCriticCfg()
@@ -1021,7 +1041,12 @@ class _PlannerLIPMPaperHeightMLPCriticCfg(ObsGroup):
     )
 
 
-def _configure_planner_lipm_paper_height_mlp_env(env_cfg) -> None:
+def _configure_planner_lipm_paper_height_mlp_env(
+    env_cfg,
+    *,
+    t_double_support: float = 0.0,
+    landing_window: float = 0.10,
+) -> None:
     """LIPM + thesis R_l landing reward + weakened swing + HeightMLP encoder.
 
     Uses ``G1TerrainMlpPPORunnerCfg`` (``ActorCriticTerrainMlp``): z-only
@@ -1031,13 +1056,17 @@ def _configure_planner_lipm_paper_height_mlp_env(env_cfg) -> None:
     Rewards: ``footstep_landing_tracking`` (eq. 4-22) primary;
     ``footstep_swing_tracking`` disabled for first-pass pipeline validation;
     ``footstep_contact_phase``=0.1.
+
+    Pass ``t_double_support > 0`` for the four-phase gait; widen ``landing_window``
+    accordingly (e.g. 0.15 s when ``t_double_support=0.05``).
     """
-    _configure_planner_lipm_env(env_cfg, use_placement_rewards=False)
+    _configure_planner_lipm_env(env_cfg, use_placement_rewards=False, t_double_support=t_double_support)
     _configure_height_mlp_env(env_cfg)
     env_cfg.observations.policy = _PlannerLIPMPaperHeightMLPPolicyCfg()
     env_cfg.observations.critic = _PlannerLIPMPaperHeightMLPCriticCfg()
     r = env_cfg.rewards
     r.footstep_landing_tracking.weight = 1.0
+    r.footstep_landing_tracking.params["landing_window"] = landing_window
     r.footstep_swing_tracking.weight = 0.0
     r.footstep_contact_phase.weight = 0.1
     r.footstep_placement_overlap.weight = 0.0
@@ -1694,6 +1723,9 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI(G1RoughEnvCfg_DTC_Plan
 
     Same terrain-free pipeline as ``PaperMLP_FLAT``, but opens the command
     distribution to forward/backward, lateral, and yaw-rate motion.
+
+    Enables four-phase double-support gait (``t_double_support=0.05``,
+    ``landing_window=0.15``) for DS timing / contact-mask validation.
     """
 
     def __post_init__(self):
@@ -1702,6 +1734,9 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT_OMNI(G1RoughEnvCfg_DTC_Plan
         self.commands.base_velocity.ranges.lin_vel_x = (-0.5, 1.0)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+        # Four-phase gait: L_swing (0.25s) | DS (0.05s) | R_swing (0.25s) | DS (0.05s) = t_step 0.6s.
+        _apply_footstep_double_support(self, t_double_support=0.05, landing_window=0.15)
 
 
 @configclass

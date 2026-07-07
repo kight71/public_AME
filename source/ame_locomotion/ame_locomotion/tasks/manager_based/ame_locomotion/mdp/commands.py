@@ -191,6 +191,19 @@ class FootstepPlanCommand(CommandTerm):
 
         # cached timing
         self._t_swing = cfg.t_step * cfg.t_swing_fraction
+        # Double-support phase boundaries (fraction of t_step).
+        # Layout: L_swing | DS_1 | R_swing | DS_2
+        t_ds = cfg.t_double_support
+        if t_ds > 0.0 and 2 * t_ds >= cfg.t_step:
+            raise ValueError(
+                f"t_double_support={t_ds} is too large for t_step={cfg.t_step}. "
+                f"Requires 2*t_double_support < t_step so each swing phase has positive duration."
+            )
+        self._t_swing_each = (cfg.t_step - 2 * t_ds) / 2.0
+        self._phase_ds1_start = self._t_swing_each / cfg.t_step
+        self._phase_ds1_end = (self._t_swing_each + t_ds) / cfg.t_step
+        self._phase_ds2_start = (2 * self._t_swing_each + t_ds) / cfg.t_step
+        # ds2 end = 1.0 (wrap)
 
         # metrics
         self.metrics["plan_step_mean_dx"] = torch.zeros(B, device=self.device)
@@ -270,6 +283,8 @@ class FootstepPlanCommand(CommandTerm):
         # plan_buffer, and the diff against the first real commit produces a
         # ~70 m² spike per env → ~-1700 reward at iter 0 (smoke 2026-06-29).
         self.prev_plan_buffer[env_ids] = self.plan_buffer[env_ids].clone()
+
+        self._update_timing_buffers()
 
     def _calibrate_hip_offset(self, env_ids: torch.Tensor):
         """Measure body-frame foot offset (= effective hip_offset_b) at the
@@ -373,6 +388,76 @@ class FootstepPlanCommand(CommandTerm):
                 f"tgtR-phantom=({tR_off[0]:+.2f},{tR_off[1]:+.2f})"
             )
 
+    def _update_timing_buffers(self):
+        """Refresh per-foot time-left and current contact-mask observations."""
+        N = self.cfg.n_future_steps
+        phase_time = self.phase * self.cfg.t_step
+
+        if self.cfg.t_double_support > 0.0:
+            t_ds = self.cfg.t_double_support
+            t_sw = self._t_swing_each
+            # In the four-phase layout, each foot's swing duration = t_sw.
+            # Elapsed in current swing: depends on which phase we're in.
+            # L_swing: phase_time in [0, t_sw), elapsed = phase_time
+            # DS_1: phase_time in [t_sw, t_sw+t_ds), no swing active (clamp to t_sw)
+            # R_swing: phase_time in [t_sw+t_ds, 2*t_sw+t_ds), elapsed = phase_time - (t_sw+t_ds)
+            # DS_2: phase_time in [2*t_sw+t_ds, t_step), no swing active
+            l_swing_elapsed = phase_time.clamp(max=t_sw)
+            r_swing_elapsed = (phase_time - t_sw - t_ds).clamp(min=0.0, max=t_sw)
+            elapsed_in_current_swing = torch.where(
+                self.swing_foot == 0, l_swing_elapsed, r_swing_elapsed
+            )
+            current_swing_duration = torch.full_like(self.phase, t_sw)
+
+            # Horizons as ABSOLUTE time from phase_time=0 (same semantics as non-DS branch).
+            # Current swing foot lands at absolute time: t_sw (for L) or 2*t_sw+t_ds (for R)
+            # We express horizons as absolute landing times so the unified
+            # `horizon - elapsed_in_current_swing` on line below works correctly.
+            k_idx = torch.arange(N, device=self.device).view(1, N, 1).float()
+            # Swing foot's k-th landing = current_swing_duration + k * t_step
+            h_swing = k_idx * self.cfg.t_step + current_swing_duration.view(-1, 1, 1)
+            # Other foot's k-th landing = t_sw + t_ds + t_sw + k * t_step = t_step - t_ds + k * t_step
+            h_other = k_idx * self.cfg.t_step + (self.cfg.t_step - t_ds)
+        else:
+            left_swing_duration = self._t_swing
+            right_swing_duration = self.cfg.t_step - self._t_swing
+            current_swing_duration = torch.where(
+                self.swing_foot == 0,
+                torch.full_like(self.phase, left_swing_duration),
+                torch.full_like(self.phase, right_swing_duration),
+            )
+            elapsed_in_current_swing = torch.where(
+                self.swing_foot == 0,
+                phase_time,
+                phase_time - left_swing_duration,
+            ).clamp(min=0.0)
+            k_idx = torch.arange(N, device=self.device).view(1, N, 1).float()
+            h_swing = k_idx * self.cfg.t_step + current_swing_duration.view(-1, 1, 1)
+            h_other = (k_idx + 1.0) * self.cfg.t_step
+
+        is_swing_left = (self.swing_foot == 0).float().view(-1, 1, 1)
+        h_left = is_swing_left * h_swing + (1.0 - is_swing_left) * h_other
+        h_right = (1.0 - is_swing_left) * h_swing + is_swing_left * h_other
+        horizon = torch.cat([h_left, h_right], dim=-1)
+        self.time_left_buffer = (horizon - elapsed_in_current_swing.view(-1, 1, 1)).clamp(min=0.0)
+
+        contact_now = torch.ones(self.num_envs, 2, device=self.device, dtype=self.phase.dtype)
+        if self.cfg.t_double_support > 0.0:
+            # During DS phases both feet should be in contact.
+            # Detect DS: L_swing=[0, t_sw), DS_1=[t_sw, t_sw+t_ds),
+            #             R_swing=[t_sw+t_ds, 2*t_sw+t_ds), DS_2=[2*t_sw+t_ds, t_step)
+            t_ds = self.cfg.t_double_support
+            t_sw = self._t_swing_each
+            in_l_swing = phase_time < t_sw
+            in_r_swing = (phase_time >= t_sw + t_ds) & (phase_time < 2 * t_sw + t_ds)
+            in_swing = in_l_swing | in_r_swing
+            # Only mask swing foot when actually in a swing phase
+            swing_mask = in_swing.float().view(-1, 1)
+            contact_now.scatter_(1, self.swing_foot.view(-1, 1), 1.0 - swing_mask)
+        else:
+            contact_now.scatter_(1, self.swing_foot.view(-1, 1), 0.0)
+        self.contact_target_buffer[:] = contact_now.view(-1, 1, 2).expand(-1, N, -1)
+
     def _update_command(self):
         if self.cfg.use_phantom:
             self._update_phantom()
@@ -380,43 +465,62 @@ class FootstepPlanCommand(CommandTerm):
         prev_phase = self.phase.clone()
         self.phase = (self.phase + dt / self.cfg.t_step) % 1.0
 
-        # time_left_in_phase(k, foot) = horizon(k, foot) - elapsed_in_stride.
-        # horizon mirrors _commit_plan's per-foot schedule:
-        #   swing foot: k*t_step + t_swing
-        #   other foot: (k+1)*t_step
-        N = self.cfg.n_future_steps
-        elapsed = self.phase * self.cfg.t_step  # (B,)
-        is_swing_left = (self.swing_foot == 0).float()  # (B,)
-        k_idx = torch.arange(N, device=self.device).view(1, N, 1).float()
-        # horizon for foot 0 (left)
-        h_swing = k_idx * self.cfg.t_step + self._t_swing
-        h_other = (k_idx + 1) * self.cfg.t_step
-        # left-foot horizon: h_swing if left is swing, else h_other
-        h_left = is_swing_left.view(-1, 1, 1) * h_swing + (1.0 - is_swing_left.view(-1, 1, 1)) * h_other
-        h_right = (1.0 - is_swing_left.view(-1, 1, 1)) * h_swing + is_swing_left.view(-1, 1, 1) * h_other
-        horizon = torch.cat([h_left, h_right], dim=-1)  # (B, N, 2)
-        self.time_left_buffer = (horizon - elapsed.view(-1, 1, 1)).clamp(min=0.0)
+        if self.cfg.t_double_support > 0.0:
+            # Four-phase gait: L_swing | DS_1 | R_swing | DS_2
+            # Latch foot on swing-end (entering DS), commit plan on DS-end (new swing start).
+            ds1_s = self._phase_ds1_start
+            ds1_e = self._phase_ds1_end
+            ds2_s = self._phase_ds2_start
 
-        # swing-foot crossover: phase crossed t_swing_fraction (left→right)
-        # or wrapped back through 0 (right→left).
-        crossed_half = (prev_phase < self.cfg.t_swing_fraction) & (
-            self.phase >= self.cfg.t_swing_fraction
-        )
-        wrapped = self.phase < prev_phase  # passed through 1.0 → 0.0
-        crossover_mask = crossed_half | wrapped
-        if crossover_mask.any():
-            ids = crossover_mask.nonzero(as_tuple=False).squeeze(-1)
-            swing_foot = self.swing_foot[ids]
-            # the foot that *was* swinging just touched down → latch its pos
-            row = torch.arange(ids.numel(), device=self.device)
-            foot_pos_w = self.robot.data.body_pos_w[ids][row, self.foot_ids[swing_foot]]
-            self.last_contact_w[ids, swing_foot] = foot_pos_w
-            # flip swing foot
-            self.swing_foot[ids] = 1 - swing_foot
-            # Commit a new plan only on crossover — targets stay fixed in world
-            # frame between crossovers (DTC-style "plan once, then track").
-            self._commit_plan(ids)
-            self.target_w[ids] = self.plan_buffer[ids, 0]
+            # L_swing → DS_1 boundary: latch left foot
+            enter_ds1 = (prev_phase < ds1_s) & (self.phase >= ds1_s)
+            if enter_ds1.any():
+                ids = enter_ds1.nonzero(as_tuple=False).squeeze(-1)
+                row = torch.arange(ids.numel(), device=self.device)
+                foot_pos_w = self.robot.data.body_pos_w[ids][row, self.foot_ids[torch.zeros_like(self.swing_foot[ids])]]
+                self.last_contact_w[ids, 0] = foot_pos_w
+
+            # DS_1 → R_swing boundary: flip to R, commit plan
+            enter_r_swing = (prev_phase < ds1_e) & (self.phase >= ds1_e)
+            if enter_r_swing.any():
+                ids = enter_r_swing.nonzero(as_tuple=False).squeeze(-1)
+                self.swing_foot[ids] = 1
+                self._commit_plan(ids)
+                self.target_w[ids] = self.plan_buffer[ids, 0]
+
+            # R_swing → DS_2 boundary: latch right foot
+            enter_ds2 = (prev_phase < ds2_s) & (self.phase >= ds2_s)
+            if enter_ds2.any():
+                ids = enter_ds2.nonzero(as_tuple=False).squeeze(-1)
+                row = torch.arange(ids.numel(), device=self.device)
+                foot_pos_w = self.robot.data.body_pos_w[ids][row, self.foot_ids[torch.ones_like(self.swing_foot[ids])]]
+                self.last_contact_w[ids, 1] = foot_pos_w
+
+            # DS_2 → L_swing boundary (wrap): flip to L, commit plan
+            wrapped = self.phase < prev_phase
+            if wrapped.any():
+                ids = wrapped.nonzero(as_tuple=False).squeeze(-1)
+                self.swing_foot[ids] = 0
+                self._commit_plan(ids)
+                self.target_w[ids] = self.plan_buffer[ids, 0]
+        else:
+            # Original two-phase gait (no DS): instant crossover.
+            crossed_half = (prev_phase < self.cfg.t_swing_fraction) & (
+                self.phase >= self.cfg.t_swing_fraction
+            )
+            wrapped = self.phase < prev_phase
+            crossover_mask = crossed_half | wrapped
+            if crossover_mask.any():
+                ids = crossover_mask.nonzero(as_tuple=False).squeeze(-1)
+                swing_foot = self.swing_foot[ids]
+                row = torch.arange(ids.numel(), device=self.device)
+                foot_pos_w = self.robot.data.body_pos_w[ids][row, self.foot_ids[swing_foot]]
+                self.last_contact_w[ids, swing_foot] = foot_pos_w
+                self.swing_foot[ids] = 1 - swing_foot
+                self._commit_plan(ids)
+                self.target_w[ids] = self.plan_buffer[ids, 0]
+
+        self._update_timing_buffers()
 
     # -------------------------------------------------------- planning
 
@@ -668,7 +772,7 @@ class FootstepPlanCommand(CommandTerm):
             dim=-1,
         )
 
-        remaining_delta_t = self.cfg.t_step
+        remaining_delta_t = self._t_swing_each if self.cfg.t_double_support > 0.0 else self.cfg.t_step
 
         # Build per-foot hip offsets in world frame (B, 2, 2)
         hip_b_xy = self.hip_offset_b[:, :2].to(device=self.device, dtype=root_pos.dtype)
@@ -713,12 +817,46 @@ class FootstepPlanCommand(CommandTerm):
                 step_duration_ts=self.cfg.t_step,
                 com_height=self.cfg.lipm_com_height,
                 step_width=self.cfg.lipm_step_width,
+                landing_yaw=landing_yaw,
             )
             foot_xy = torch.where(is_swing.unsqueeze(-1), arc_xy, stance_xy)
             targets[:, foot_idx, :2] = foot_xy
             targets[:, foot_idx, 2] = 0.0
             landing_yaws[:, foot_idx] = landing_yaw
             landing_root_pos[:, foot_idx] = root_pos_kf
+
+            if self.cfg.debug_arc_planner and env_count > 0:
+                i = 0
+                foot_name = "L" if foot_idx == 0 else "R"
+                is_sw = is_swing[i].item()
+                v_eff_i = v_eff_all[i, foot_idx].cpu().tolist()
+                hip_i = landing_hip_xy[i].cpu().tolist()
+                tgt_i = foot_xy[i].cpu().tolist()
+                theta_i = torch.atan2(v_eff_all[i, foot_idx, 1], v_eff_all[i, foot_idx, 0]).item()
+                ly_i = landing_yaw[i].item()
+                import math
+                # target - landing_hip offset
+                dx = tgt_i[0] - hip_i[0]
+                dy = tgt_i[1] - hip_i[1]
+                # signed lateral in body frame (positive = left of body heading)
+                c_b, s_b = math.cos(ly_i), math.sin(ly_i)
+                lat_signed = -s_b * dx + c_b * dy
+                fwd_signed = c_b * dx + s_b * dy
+                # arc radius: R = |v_cmd| / |wz| (approximate)
+                wz_i = wz[i].item()
+                speed_i = math.hypot(v_eff_i[0], v_eff_i[1])
+                arc_r = speed_i / max(abs(wz_i), 1e-4)
+                print(
+                    f"[arc_dbg] foot={foot_name} swing={int(is_sw)} "
+                    f"v_eff=({v_eff_i[0]:.3f},{v_eff_i[1]:.3f}) "
+                    f"theta={math.degrees(theta_i):.1f}deg "
+                    f"body_yaw={math.degrees(ly_i):.1f}deg "
+                    f"hip=({hip_i[0]:.3f},{hip_i[1]:.3f}) "
+                    f"tgt=({tgt_i[0]:.3f},{tgt_i[1]:.3f}) "
+                    f"tgt-hip_body=(fwd={fwd_signed:.4f},lat={lat_signed:.4f}) "
+                    f"arc_R={arc_r:.3f}m",
+                    flush=True,
+                )
 
         return targets, landing_yaws, landing_root_pos
 
@@ -833,8 +971,15 @@ class FootstepPlanCommand(CommandTerm):
 
         for k in range(N):
             is_swing = (swing_foot.unsqueeze(1) == torch.arange(2, device=self.device).view(1, 2)).float()
-            h_swing = k * self.cfg.t_step + self._t_swing
-            h_other = (k + 1) * self.cfg.t_step
+            if self.cfg.t_double_support > 0.0:
+                # Four-phase gait: commit happens at DS-end, so swing starts now.
+                # Swing foot lands after _t_swing_each; other foot lands after full t_step - t_ds.
+                t_sw_k = self._t_swing_each
+                h_swing = k * self.cfg.t_step + t_sw_k
+                h_other = k * self.cfg.t_step + (self.cfg.t_step - self.cfg.t_double_support)
+            else:
+                h_swing = k * self.cfg.t_step + self._t_swing
+                h_other = (k + 1) * self.cfg.t_step
             horizons = is_swing * h_swing + (1.0 - is_swing) * h_other  # (E, 2)
 
             if self.cfg.use_lipm_prior:
@@ -914,12 +1059,37 @@ class FootstepPlanCommand(CommandTerm):
                 )
 
             selected = out["selected_xyz_w"]
+            if self.cfg.use_lipm_prior:
+                swing_mask = (
+                    swing_foot.unsqueeze(1) == torch.arange(2, device=self.device).view(1, 2)
+                )
+                last_contact = self.last_contact_w[env_ids]
+                selected = torch.where(swing_mask.unsqueeze(-1), selected, last_contact)
+                out["foothold_score"] = torch.where(
+                    swing_mask,
+                    out["foothold_score"],
+                    torch.ones_like(out["foothold_score"]),
+                )
+                out["used_fallback"] = torch.where(
+                    swing_mask,
+                    out["used_fallback"],
+                    torch.zeros_like(out["used_fallback"]),
+                )
+                out["valid_count"] = torch.where(
+                    swing_mask,
+                    out["valid_count"],
+                    torch.zeros_like(out["valid_count"]),
+                )
+                out["per_cost_debug"] = torch.where(
+                    swing_mask.unsqueeze(-1),
+                    out["per_cost_debug"],
+                    torch.zeros_like(out["per_cost_debug"]),
+                )
             self.plan_buffer[env_ids, k] = selected
             self.foothold_score_buffer[env_ids, k] = out["foothold_score"]
             self.used_fallback_buffer[env_ids, k] = out["used_fallback"]
             self.valid_count_buffer[env_ids, k] = out["valid_count"]
             self.per_cost_debug_buffer[env_ids, k] = out["per_cost_debug"]
-            self.contact_target_buffer[env_ids, k] = 1.0
 
             planned_terrain_z = selected[..., 2] + G1_SOLE_Z_OFFSET
 
@@ -956,26 +1126,25 @@ class FootstepPlanCommand(CommandTerm):
         if not self.robot.is_initialized:
             return
         B = self.num_envs
-        pos_left = self.target_w[:, 0]
-        pos_right = self.target_w[:, 1]
+        row = torch.arange(B, device=self.device)
+        pos_swing = self.target_w[row, self.swing_foot]
         pos_last = self.last_contact_w.reshape(B * 2, 3)
+        swing_marker_indices = self.swing_foot
         if self.cfg.use_phantom:
-            positions = torch.cat([pos_left, pos_right, pos_last, self.phantom_pos_w], dim=0)
+            positions = torch.cat([pos_swing, pos_last, self.phantom_pos_w], dim=0)
             marker_indices = torch.cat(
                 [
-                    torch.zeros(B, dtype=torch.long, device=self.device),
-                    torch.ones(B, dtype=torch.long, device=self.device),
+                    swing_marker_indices,
                     torch.full((2 * B,), 2, dtype=torch.long, device=self.device),
                     torch.full((B,), 3, dtype=torch.long, device=self.device),
                 ],
                 dim=0,
             )
         else:
-            positions = torch.cat([pos_left, pos_right, pos_last], dim=0)
+            positions = torch.cat([pos_swing, pos_last], dim=0)
             marker_indices = torch.cat(
                 [
-                    torch.zeros(B, dtype=torch.long, device=self.device),
-                    torch.ones(B, dtype=torch.long, device=self.device),
+                    swing_marker_indices,
                     torch.full((2 * B,), 2, dtype=torch.long, device=self.device),
                 ],
                 dim=0,
@@ -1002,10 +1171,15 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     """Name of the velocity command term to read forward-prediction signal from."""
 
     t_step: float = 0.6
-    """Full stride duration, seconds (one left-swing + one right-swing)."""
+    """Full stride duration, seconds (one left-swing + one right-swing + DS phases)."""
 
     t_swing_fraction: float = 0.5
-    """Fraction of ``t_step`` spent in single-support per foot."""
+    """Fraction of ``t_step`` spent in single-support per foot (when t_double_support=0)."""
+
+    t_double_support: float = 0.0
+    """Duration of each symmetric double-support phase in seconds.
+    Total stride = t_swing_L + t_ds + t_swing_R + t_ds = t_step.
+    When 0, the phase clock behaves as before (no DS, instant crossover)."""
 
     raibert_k: float = 0.05
     """Velocity-tracking feedback gain in the Raibert heuristic."""
@@ -1128,6 +1302,10 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     selector_v2_lambda_overhang: float = 2.0
     selector_v2_debug_masks: bool = False
     """When True, print per-mask valid counts on each v2 commit (env 0, smoke/debug)."""
+
+    debug_arc_planner: bool = False
+    """When True, print per-foot v_eff, heading, landing_hip, and target for env 0
+    on each LIPM arc plan commit. Use to verify arc-shaped lateral placement."""
 
     hip_y: float = 0.10
     """Hardcoded |y| hip offset in body frame (Phase 0 approximation)."""

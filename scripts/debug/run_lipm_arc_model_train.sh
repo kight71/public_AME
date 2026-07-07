@@ -17,9 +17,9 @@ fi
 
 TASK="${TASK:-AME-G1-29DOF-DTC-PlannerV2-LIPM-PaperMLP-FlatOmni-v0}"
 ITER="${ITER:-15000}"
-NUM_ENVS="${NUM_ENVS:-1024}"
+NUM_ENVS="${NUM_ENVS:-4096}"
 RUN_NAME="${RUN_NAME:-lipm_arc_flat_omni}"
-LOGGER="${LOGGER:-tensorboard}"
+LOGGER="${LOGGER:-wandb}"
 LOG_PROJECT="${LOG_PROJECT:-ame_lipm_arc}"
 
 echo "LIPM arc-model flat omni training"

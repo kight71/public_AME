@@ -219,11 +219,12 @@ def footstep_plan(env: ManagerBasedRLEnv, command_name: str = "footstep_plan") -
 
 
 def footstep_phase_info(env: ManagerBasedRLEnv, command_name: str = "footstep_plan") -> torch.Tensor:
-    """Body-agnostic phase metadata per planned step: (time_left, contact_target).
+    """Body-agnostic phase metadata per planned step: (time_left, contact_mask).
 
     Returns ``(B, N*2*2)`` flattened in order ``(k, foot, [time_left, contact])``.
-    Use alongside :func:`footstep_plan` to give the policy the DTC
-    "what / where / when" triplet for each future step.
+    ``contact`` is the current phase mask: 0 for the active swing foot and 1
+    for the stance foot. Use alongside :func:`footstep_plan` to give the
+    policy the DTC "what / where / when" triplet for each future step.
     """
     cmd = env.command_manager.get_term(command_name)
     # (B, N, 2, 2)

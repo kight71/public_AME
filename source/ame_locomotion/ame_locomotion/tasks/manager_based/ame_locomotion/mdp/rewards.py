@@ -566,32 +566,52 @@ def footstep_contact_phase(
 ) -> torch.Tensor:
     """Per-step reward for matching the planned contact schedule.
 
-    Expected contact (1 = on ground, 0 = airborne):
-        left foot  on ground iff  phase >= t_swing_fraction
-        right foot on ground iff  phase <  t_swing_fraction
+    With ``t_double_support > 0``, the stride has four phases:
+        L_swing:  left=0, right=1
+        DS_1:     left=1, right=1  (double support)
+        R_swing:  left=1, right=0
+        DS_2:     left=1, right=1  (double support)
 
-    reward = **product** over feet of ``1 - |expected - actual|``  →
+    When ``t_double_support == 0`` (default), there are no DS phases and the
+    expected schedule is the original two-phase: left on ground iff
+    phase >= t_swing_fraction, right on ground iff phase < t_swing_fraction.
+
+    reward = **product** over feet of ``1 - |expected - actual|``  ->
     ``(B,)`` in ``{0, 1}``. Product (AND) rather than mean (OR) is
     important: with mean, a "both feet always in contact" policy could
     free-load 0.5 reward (one foot always matched). Product gives 0
     unless BOTH feet match the planned schedule simultaneously — the
-    only state earning the reward is correct single-stance.
+    only state earning the reward is correct single-stance (or correct DS).
     """
     cmd = env.command_manager.get_term(command_name)
-    phase = cmd.phase                                     # (B,)
-    f = cmd.cfg.t_swing_fraction
+    phase = cmd.phase  # (B,)
 
-    expected_left = (phase >= f).float()
-    expected_right = (phase < f).float()
-    expected = torch.stack([expected_left, expected_right], dim=-1)            # (B, 2)
+    if cmd.cfg.t_double_support > 0.0:
+        ds1_s = cmd._phase_ds1_start
+        ds1_e = cmd._phase_ds1_end
+        ds2_s = cmd._phase_ds2_start
+        # L_swing: [0, ds1_s) → left=0, right=1
+        # DS_1:    [ds1_s, ds1_e) → left=1, right=1
+        # R_swing: [ds1_e, ds2_s) → left=1, right=0
+        # DS_2:    [ds2_s, 1.0) → left=1, right=1
+        in_l_swing = (phase < ds1_s).float()
+        in_r_swing = ((phase >= ds1_e) & (phase < ds2_s)).float()
+        expected_left = 1.0 - in_l_swing  # 0 during L_swing, 1 otherwise
+        expected_right = 1.0 - in_r_swing  # 0 during R_swing, 1 otherwise
+    else:
+        f = cmd.cfg.t_swing_fraction
+        expected_left = (phase >= f).float()
+        expected_right = (phase < f).float()
+
+    expected = torch.stack([expected_left, expected_right], dim=-1)  # (B, 2)
 
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    forces = contact_sensor.data.net_forces_w_history.norm(dim=-1)             # (B, T, K)
-    foot_forces = forces.max(dim=1).values[:, sensor_cfg.body_ids]             # (B, 2)
+    forces = contact_sensor.data.net_forces_w_history.norm(dim=-1)  # (B, T, K)
+    foot_forces = forces.max(dim=1).values[:, sensor_cfg.body_ids]  # (B, 2)
     actual = (foot_forces > force_threshold).float()
 
-    match = 1.0 - (expected - actual).abs()                                    # (B, 2)
-    return match[:, 0] * match[:, 1]                                            # (B,) AND
+    match = 1.0 - (expected - actual).abs()  # (B, 2)
+    return match[:, 0] * match[:, 1]  # (B,) AND
 
 
 def footstep_swing_tracking_log(
@@ -995,6 +1015,7 @@ def footstep_landing_tracking(
     force_threshold: float = 1.0,
     sigma: float = 0.12,
     use_xyz: bool = True,
+    landing_window: float = 0.0,
 ) -> torch.Tensor:
     """Paper-style foothold tracking reward R_l — contact-time only.
 
@@ -1002,6 +1023,12 @@ def footstep_landing_tracking(
     trajectory. It scores how close the **actual foot position** is to the
     committed planner target while the foot is on the ground (thesis §4.4.3,
     eq. 4-22).
+
+    When ``landing_window > 0``, an additional phase-window gate is applied:
+    the reward is only nonzero during the last ``landing_window`` seconds of
+    each foot's swing phase (i.e. near the expected touchdown moment). This
+    discourages the policy from rushing the foot to the target early in the
+    swing just to collect reward.
 
     Returns ``(B,)`` in ``[0, 2]`` (sum over contact feet).
     """
@@ -1017,6 +1044,27 @@ def footstep_landing_tracking(
     forces = contact_sensor.data.net_forces_w_history.norm(dim=-1)
     foot_forces = forces.max(dim=1).values[:, sensor_cfg.body_ids]
     in_contact = (foot_forces > force_threshold).float()
+
+    if landing_window > 0.0:
+        phase = cmd.phase  # (B,)
+        t_step = cmd.cfg.t_step
+        w_frac = landing_window / t_step
+
+        if cmd.cfg.t_double_support > 0.0:
+            # Four-phase: landing window is at end of each swing (before DS).
+            ds1_s = cmd._phase_ds1_start
+            ds2_s = cmd._phase_ds2_start
+            left_in_window = ((phase >= ds1_s - w_frac) & (phase < ds1_s)).float()
+            right_in_window = ((phase >= ds2_s - w_frac) & (phase < ds2_s)).float()
+        else:
+            f = cmd.cfg.t_swing_fraction
+            # Left foot landing window: phase in [f - w_frac, f)
+            left_in_window = ((phase >= f - w_frac) & (phase < f)).float()
+            # Right foot landing window: phase in [1.0 - w_frac, 1.0)
+            right_in_window = (phase >= 1.0 - w_frac).float()
+
+        phase_gate = torch.stack([left_in_window, right_in_window], dim=-1)
+        in_contact = in_contact * phase_gate
 
     return planner_ops.landing_tracking_exp(
         foot_pos_w, target_w, in_contact, sigma, use_xyz=use_xyz

@@ -225,6 +225,7 @@ def lipm_arc_nominal_foothold_xy(
     com_height: float | torch.Tensor,
     step_width: float = 0.24,
     arc_push_factor: float = 0.0,
+    landing_yaw: torch.Tensor | None = None,
     eps: float = 1e-3,
     g: float = 9.81,
 ) -> torch.Tensor:
@@ -232,7 +233,13 @@ def lipm_arc_nominal_foothold_xy(
 
     ``effective_vel_xy`` is the per-foot equivalent velocity
     ``v_cmd_xy + wz x hip_offset``. It defines both the LIPM step length and the
-    heading used to rotate the dynamic offset around the landing hip.
+    heading used to rotate the **forward** dynamic offset around the landing hip.
+
+    When ``landing_yaw`` is provided, the **lateral** offset (step width) is
+    rotated by the predicted body heading at touchdown rather than by the
+    v_eff heading. This ensures the two feet straddle the arc trajectory
+    (one foot on each side of the body) even when forward velocity dominates
+    and makes both feet's v_eff headings nearly identical.
 
     For true zero command (no translation and no yaw), the target is the neutral
     landing hip instead of the old ICP/stall fallback.
@@ -254,9 +261,23 @@ def lipm_arc_nominal_foothold_xy(
 
     off_x = arc_push_factor * sd - bx
     off_y = side * by
-    c, s = torch.cos(theta), torch.sin(theta)
-    rot_x = c * off_x - s * off_y
-    rot_y = s * off_x + c * off_y
+
+    if landing_yaw is not None:
+        # Forward offset rotated by v_eff heading (along movement direction)
+        c_v, s_v = torch.cos(theta), torch.sin(theta)
+        fwd_x = c_v * off_x
+        fwd_y = s_v * off_x
+        # Lateral offset rotated by body heading (perpendicular to body)
+        c_b, s_b = torch.cos(landing_yaw), torch.sin(landing_yaw)
+        lat_x = -s_b * off_y
+        lat_y = c_b * off_y
+        rot_x = fwd_x + lat_x
+        rot_y = fwd_y + lat_y
+    else:
+        c, s = torch.cos(theta), torch.sin(theta)
+        rot_x = c * off_x - s * off_y
+        rot_y = s * off_x + c * off_y
+
     p_hat = landing_hip_xy + torch.stack([rot_x, rot_y], dim=-1)
 
     return torch.where((speed < eps).unsqueeze(-1), landing_hip_xy, p_hat)

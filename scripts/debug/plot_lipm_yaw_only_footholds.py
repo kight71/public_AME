@@ -82,6 +82,7 @@ def _simulate(lipm, args: argparse.Namespace) -> dict:
             sw_t,
             remaining_delta_t=args.t_step, step_duration_ts=args.t_step,
             com_height=args.com_height, step_width=args.step_width,
+            landing_yaw=torch.tensor([landing_yaw], dtype=torch.float32),
         )
         target = target_t[0].numpy()
 
