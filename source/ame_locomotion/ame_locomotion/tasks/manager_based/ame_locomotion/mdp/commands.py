@@ -947,7 +947,7 @@ class FootstepPlanCommand(CommandTerm):
                 "can be derived (see FootstepPlanCommand.__init__)."
             )
 
-        from . import foothold_selection
+        from . import foothold_candidates, foothold_selection
 
         N = self.cfg.n_future_steps
         if self.cfg.use_lipm_prior:
@@ -963,6 +963,12 @@ class FootstepPlanCommand(CommandTerm):
         grid_yaw = self.robot.data.heading_w[env_ids]
 
         planned_terrain_z = self.last_contact_w[env_ids, :, 2] + G1_SOLE_Z_OFFSET
+        candidate_mode = self.cfg.selector_v2_candidate_mode
+        if candidate_mode not in ("fixed_window", "terrain_window"):
+            raise ValueError(
+                "selector_v2_candidate_mode must be 'fixed_window' or 'terrain_window', "
+                f"got {candidate_mode!r}."
+            )
 
         self.foothold_score_buffer[env_ids] = 0.0
         self.used_fallback_buffer[env_ids] = False
@@ -1009,8 +1015,31 @@ class FootstepPlanCommand(CommandTerm):
             fallback_hip_y, fallback_leg_length = self._fallback_hip_params()
             debug_masks = self.cfg.selector_v2_debug_masks
 
-            out = foothold_selection.select_foothold_v2(
+            if candidate_mode == "fixed_window":
+                candidates_terrain, candidate_mask = foothold_candidates.generate_candidates(
+                    nominal_xy_w,
+                    ray_hits_w,
+                    grid_center_w,
+                    grid_yaw,
+                    grid_shape=self._cost_grid_shape,
+                    grid_resolution=self._cost_grid_resolution,
+                    half_width_cells=2,
+                )
+            else:
+                candidates_terrain, candidate_mask = foothold_candidates.generate_terrain_window_candidates(
+                    nominal_xy_w,
+                    ray_hits_w,
+                    grid_center_w,
+                    grid_yaw,
+                    grid_shape=self._cost_grid_shape,
+                    grid_resolution=self._cost_grid_resolution,
+                    half_width_cells=self.cfg.selector_v2_terrain_half_width_cells,
+                )
+
+            out = foothold_selection.score_foothold_candidates_v2(
                 nominal_xy_w,
+                candidates_terrain,
+                candidate_mask,
                 ray_hits_w,
                 body_pos_w=body_pos_w,
                 body_yaw=body_yaw,
@@ -1289,6 +1318,13 @@ class FootstepPlanCommandCfg(CommandTermCfg):
     use_selector_v2: bool = False
     """When True, use :func:`foothold_selection.select_foothold_v2` (patch-stats
     selector) instead of snap-to-ray or legacy cost selection."""
+
+    selector_v2_candidate_mode: str = "fixed_window"
+    """Candidate generator for Planner V2: ``fixed_window`` keeps the legacy 5x5
+    window, while ``terrain_window`` uses a larger terrain-grid window."""
+
+    selector_v2_terrain_half_width_cells: int = 4
+    """Half-width for ``terrain_window`` candidates; ``4`` gives a 9x9 set."""
 
     selector_v2_max_step_dz: float = 0.20
     selector_v2_max_dz_omega: float = 0.10

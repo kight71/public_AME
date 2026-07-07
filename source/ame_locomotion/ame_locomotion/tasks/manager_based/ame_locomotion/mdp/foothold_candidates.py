@@ -10,7 +10,7 @@ from .gridmap_utils import (
     world_xy_to_grid_float,
 )
 
-__all__ = ["generate_candidates"]
+__all__ = ["generate_candidates", "generate_terrain_window_candidates"]
 
 
 def generate_candidates(
@@ -90,3 +90,31 @@ def generate_candidates(
         grid_shape=grid_shape,
     )
     return candidate_xyz_w, in_bounds_mask
+
+
+def generate_terrain_window_candidates(
+    nominal_xy_w: torch.Tensor,
+    ray_hits_w: torch.Tensor,
+    grid_center_w: torch.Tensor,
+    grid_yaw: torch.Tensor,
+    *,
+    grid_shape: tuple[int, int],
+    grid_resolution: float,
+    half_width_cells: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate a larger terrain-aware candidate window around each nominal foothold.
+
+    This is intentionally terrain-class agnostic: it only gathers scanner grid
+    cells around the nominal xy prior and leaves steppability decisions to the
+    Planner V2 scoring/filtering layer. The default ``4`` yields a
+    ``9 x 9 = 81`` candidate set.
+    """
+    return generate_candidates(
+        nominal_xy_w,
+        ray_hits_w,
+        grid_center_w,
+        grid_yaw,
+        grid_shape=grid_shape,
+        grid_resolution=grid_resolution,
+        half_width_cells=half_width_cells,
+    )

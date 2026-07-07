@@ -157,6 +157,32 @@ def test_5x5_default(fc):
     assert mask.shape[-1] == 25
 
 
+def test_terrain_window_default_9x9(fc):
+    raibert = torch.zeros(1, 2, 2)
+    rays = _regular_rays()
+    candidates, mask = fc.generate_terrain_window_candidates(
+        raibert,
+        rays,
+        grid_center_w=torch.zeros(1, 2),
+        grid_yaw=torch.zeros(1),
+        grid_shape=(21, 33),
+        grid_resolution=0.05,
+    )
+    expected, expected_mask = fc.generate_candidates(
+        raibert,
+        rays,
+        grid_center_w=torch.zeros(1, 2),
+        grid_yaw=torch.zeros(1),
+        grid_shape=(21, 33),
+        grid_resolution=0.05,
+        half_width_cells=4,
+    )
+    assert candidates.shape == (1, 2, 81, 3)
+    assert mask.shape == (1, 2, 81)
+    assert torch.equal(candidates, expected)
+    assert torch.equal(mask, expected_mask)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for VRAM smoke test")
 def test_no_python_loops(fc):
     device = torch.device("cuda")

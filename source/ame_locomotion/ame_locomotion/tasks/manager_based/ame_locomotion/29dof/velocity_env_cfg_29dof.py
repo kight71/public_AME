@@ -1678,6 +1678,25 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP(G1RoughEnvCfg_DTC_FORWARD):
 
 
 @configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_TERRAIN_WINDOW(
+    G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP
+):
+    """Low-step terrain smoke env using terrain-window V2 candidates and DS gait."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = LOW_STEP_TERRAINS_CFG
+        self.scene.terrain.max_init_terrain_level = 0
+        self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+
+        self.commands.footstep_plan.selector_v2_candidate_mode = "terrain_window"
+        self.commands.footstep_plan.selector_v2_terrain_half_width_cells = 4
+        _apply_footstep_double_support(self, t_double_support=0.05, landing_window=0.15)
+
+
+@configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP):
     """Flat-ground LIPM PaperMLP smoke env for validating the planner/reward pipeline.
 

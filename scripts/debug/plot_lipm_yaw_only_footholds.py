@@ -19,6 +19,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import numpy as np
 import torch
 
@@ -40,14 +41,31 @@ def _rot2(yaw: float) -> np.ndarray:
     return np.array([[c, -s], [s, c]], dtype=float)
 
 
+def _advance_root(root_xy: np.ndarray, root_yaw: float, args: argparse.Namespace, dt: float) -> tuple[np.ndarray, float]:
+    """Midpoint integration for command-following root motion over ``dt``."""
+    mid_yaw = root_yaw + 0.5 * args.wz * dt
+    vel_mid = _rot2(mid_yaw) @ np.array([args.vx, args.vy])
+    return root_xy + vel_mid * dt, root_yaw + args.wz * dt
+
+
 def _simulate(lipm, args: argparse.Namespace) -> dict:
+    if args.t_double_support > 0.0 and 2.0 * args.t_double_support >= args.t_step:
+        raise ValueError("Requires 0 <= 2 * t_double_support < t_step.")
+
     hip_b = np.array([[args.hip_x, +args.hip_y], [args.hip_x, -args.hip_y]])
 
     contacts = hip_b.copy()
     root_xy = np.array([0.0, 0.0])
     root_yaw = 0.0
     swing_foot = 0
-    t_swing = args.t_step * args.t_swing_fraction
+    if args.t_double_support > 0.0:
+        t_swing = 0.5 * (args.t_step - 2.0 * args.t_double_support)
+        dt_to_next_swing = t_swing + args.t_double_support
+        remaining_delta_t = t_swing
+    else:
+        t_swing = args.t_step * args.t_swing_fraction
+        dt_to_next_swing = t_swing
+        remaining_delta_t = args.t_step
 
     root_hist = [root_xy.copy()]
     yaw_hist = [root_yaw]
@@ -55,6 +73,8 @@ def _simulate(lipm, args: argparse.Namespace) -> dict:
     right_hist = [contacts[1].copy()]
     target_hist = []
     swing_hist = []
+    phase_segments = []
+    time_s = 0.0
 
     for _ in range(args.steps):
         c, s = math.cos(root_yaw), math.sin(root_yaw)
@@ -62,11 +82,7 @@ def _simulate(lipm, args: argparse.Namespace) -> dict:
         vel_cmd_w = R @ np.array([args.vx, args.vy])
         hip_w = (R @ hip_b.T).T
 
-        mid_yaw = root_yaw + 0.5 * args.wz * t_swing
-        c_m, s_m = math.cos(mid_yaw), math.sin(mid_yaw)
-        vel_mid = np.array([[c_m, -s_m], [s_m, c_m]]) @ np.array([args.vx, args.vy])
-        landing_root = root_xy + vel_mid * t_swing
-        landing_yaw = root_yaw + args.wz * t_swing
+        landing_root, landing_yaw = _advance_root(root_xy, root_yaw, args, t_swing)
         landing_hip = landing_root + _rot2(landing_yaw) @ hip_b[swing_foot]
 
         v_cmd_t = torch.from_numpy(vel_cmd_w.astype(np.float32)).unsqueeze(0)
@@ -80,11 +96,16 @@ def _simulate(lipm, args: argparse.Namespace) -> dict:
             landing_hip_t,
             v_eff_t,
             sw_t,
-            remaining_delta_t=args.t_step, step_duration_ts=args.t_step,
+            remaining_delta_t=remaining_delta_t, step_duration_ts=args.t_step,
             com_height=args.com_height, step_width=args.step_width,
             landing_yaw=torch.tensor([landing_yaw], dtype=torch.float32),
         )
         target = target_t[0].numpy()
+
+        swing_name = "L_swing" if swing_foot == 0 else "R_swing"
+        phase_segments.append((time_s, time_s + t_swing, swing_name))
+        if args.t_double_support > 0.0:
+            phase_segments.append((time_s + t_swing, time_s + t_swing + args.t_double_support, "DS"))
 
         contacts[swing_foot] = target
         target_hist.append(target.copy())
@@ -92,8 +113,8 @@ def _simulate(lipm, args: argparse.Namespace) -> dict:
         left_hist.append(contacts[0].copy())
         right_hist.append(contacts[1].copy())
 
-        root_xy = landing_root
-        root_yaw = landing_yaw
+        root_xy, root_yaw = _advance_root(root_xy, root_yaw, args, dt_to_next_swing)
+        time_s += dt_to_next_swing
         root_hist.append(root_xy.copy())
         yaw_hist.append(root_yaw)
         swing_foot = 1 - swing_foot
@@ -106,7 +127,56 @@ def _simulate(lipm, args: argparse.Namespace) -> dict:
         "target": np.array(target_hist),
         "swing": np.array(swing_hist),
         "t_swing": t_swing,
+        "t_double_support": args.t_double_support,
+        "dt_to_next_swing": dt_to_next_swing,
+        "phase_segments": phase_segments,
     }
+
+
+def _plot_phase_timeline(ax, data: dict, args: argparse.Namespace) -> None:
+    colors = {"L_swing": "#2196F3", "R_swing": "#F44336", "DS": "#43A047"}
+    t_sw = data["t_swing"]
+    t_ds = data["t_double_support"]
+    if t_ds > 0.0:
+        segments = [
+            (0.0, t_sw, "L_swing", "L swing\nR stance"),
+            (t_sw, t_ds, "DS", "DS\nboth feet"),
+            (t_sw + t_ds, t_sw, "R_swing", "R swing\nL stance"),
+            (2.0 * t_sw + t_ds, t_ds, "DS", "DS\nboth feet"),
+        ]
+    else:
+        segments = [
+            (0.0, t_sw, "L_swing", "L swing\nR stance"),
+            (t_sw, args.t_step - t_sw, "R_swing", "R swing\nL stance"),
+        ]
+
+    for start, width, name, label in segments:
+        ax.broken_barh([(start, width)], (0.32, 0.36), facecolors=colors[name], alpha=0.85)
+        ax.text(
+            start + 0.5 * width,
+            0.50,
+            label,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="white" if name != "DS" else "black",
+        )
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlim(0.0, args.t_step)
+    ax.set_yticks([])
+    ax.set_xlabel("time [s]")
+    ax.set_title("One gait cycle contact phase")
+    ax.grid(True, axis="x", alpha=0.25)
+    ax.legend(
+        handles=[
+            Patch(facecolor=colors["L_swing"], label="left swing"),
+            Patch(facecolor=colors["DS"], label="double support"),
+            Patch(facecolor=colors["R_swing"], label="right swing"),
+        ],
+        loc="upper right",
+        fontsize=8,
+        ncol=3,
+    )
 
 
 def _plot(data: dict, args: argparse.Namespace) -> None:
@@ -117,7 +187,10 @@ def _plot(data: dict, args: argparse.Namespace) -> None:
     target = data["target"]
     swing = data["swing"]
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig = plt.figure(figsize=(8.5, 10.0), constrained_layout=True)
+    gs = fig.add_gridspec(2, 1, height_ratios=[4.0, 1.0], hspace=0.28)
+    ax = fig.add_subplot(gs[0])
+    ax_phase = fig.add_subplot(gs[1])
     ax.plot(root_xy[:, 0], root_xy[:, 1], "k-", lw=2, alpha=0.6, label="CoM path")
     ax.scatter(root_xy[0, 0], root_xy[0, 1], s=100, color="black", marker="s", zorder=6)
     ax.plot(left[:, 0], left[:, 1], "o-", color="#2196F3", lw=1.2, ms=6, label="left foot", alpha=0.85)
@@ -147,17 +220,19 @@ def _plot(data: dict, args: argparse.Namespace) -> None:
     ax.set_ylabel("world y [m]")
     ax.set_title(
         f"LIPM Arc-Model: vx={args.vx:.2f}, vy={args.vy:.2f}, wz={args.wz:.2f} rad/s\n"
-        f"(per-foot v_eff = v_cmd + wz x hip_offset)"
+        f"L_swing {data['t_swing']:.2f}s | DS {data['t_double_support']:.2f}s | "
+        f"R_swing {data['t_swing']:.2f}s | DS {data['t_double_support']:.2f}s"
     )
     ax.legend(loc="best", fontsize=8)
 
     v_eff_mag = math.hypot(args.vx + args.wz * args.hip_y, args.vy)
     text = (
         f"v_eff (left) = |v_cmd + wz*(-hip_y, 0)| = {v_eff_mag:.3f} m/s\n"
-        f"t_swing={data['t_swing']:.2f}s, yaw/step={args.wz * data['t_swing']:.2f} rad"
+        f"t_step={args.t_step:.2f}s, t_swing={data['t_swing']:.2f}s, "
+        f"DS={data['t_double_support']:.2f}s, yaw/swing={args.wz * data['t_swing']:.2f} rad"
     )
     fig.text(0.06, 0.02, text, fontsize=9)
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    _plot_phase_timeline(ax_phase, data, args)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +252,7 @@ def main() -> int:
     parser.add_argument("--wz", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--t-step", type=float, default=0.6)
+    parser.add_argument("--t-double-support", type=float, default=0.05)
     parser.add_argument("--t-swing-fraction", type=float, default=0.5)
     parser.add_argument("--hip-x", type=float, default=0.0)
     parser.add_argument("--hip-y", type=float, default=0.12)

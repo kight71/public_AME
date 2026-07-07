@@ -51,6 +51,7 @@ __all__ = [
     "foothold_quality_at_centers",
     "reachability_mask",
     "roughness_cap_mask",
+    "score_foothold_candidates_v2",
     "select_foothold_by_cost",
     "select_foothold_v2",
     "step_height_mask",
@@ -328,8 +329,10 @@ def _under_hip_fallback_w(
     return out
 
 
-def select_foothold_v2(
-    raibert_xy_w: torch.Tensor,
+def score_foothold_candidates_v2(
+    nominal_xy_w: torch.Tensor,
+    candidate_terrain_xyz_w: torch.Tensor,
+    candidate_mask: torch.Tensor,
     ray_hits_w: torch.Tensor,
     body_pos_w: torch.Tensor,
     body_yaw: torch.Tensor,
@@ -340,7 +343,6 @@ def select_foothold_v2(
     grid_resolution: float,
     grid_center_w: torch.Tensor,
     grid_yaw: torch.Tensor,
-    half_width_cells: int = 2,
     foot_length: float = 0.18,
     foot_width: float = 0.065,
     n_long: int = 4,
@@ -369,38 +371,47 @@ def select_foothold_v2(
     enable_fallback: bool = True,
     return_mask_debug: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Planner V2 foothold selector: fixed grid candidates + patch stats + hard filters + soft costs.
+    """Score pre-generated Planner V2 terrain candidates and select one per foot.
 
-    ``body_pos_w`` / ``body_yaw`` should be the **landing-time** pelvis pose per foot
-    ``(B, F, 3)`` / ``(B, F)`` when horizons differ across feet; using the current
-    pelvis with long-horizon Raibert priors falsely rejects stance-foot candidates.
+    ``candidate_terrain_xyz_w`` stores scanner terrain xyz. The returned
+    ``selected_xyz_w`` stores foot-body targets, using the same sole-z convention
+    as :func:`select_foothold_v2`.
     """
     if grid_center_w is None or grid_yaw is None:
-        raise ValueError("select_foothold_v2 requires grid_center_w and grid_yaw (Task 0.1 contract).")
-    if raibert_xy_w.shape[-1] not in (2, 3):
+        raise ValueError("score_foothold_candidates_v2 requires grid_center_w and grid_yaw.")
+    if nominal_xy_w.shape[-1] not in (2, 3):
         raise ValueError(
-            f"raibert_xy_w last dim must be 2 (xy) or 3 (xyz prior); got shape {tuple(raibert_xy_w.shape)}."
+            f"nominal_xy_w last dim must be 2 (xy) or 3 (xyz prior); got shape {tuple(nominal_xy_w.shape)}."
+        )
+    if candidate_terrain_xyz_w.ndim != 4 or candidate_terrain_xyz_w.shape[-1] != 3:
+        raise ValueError(
+            "candidate_terrain_xyz_w must be (B, F, K, 3), "
+            f"got shape {tuple(candidate_terrain_xyz_w.shape)}."
+        )
+    if candidate_mask.shape != candidate_terrain_xyz_w.shape[:3]:
+        raise ValueError(
+            f"candidate_mask must be {tuple(candidate_terrain_xyz_w.shape[:3])}, "
+            f"got {tuple(candidate_mask.shape)}."
         )
 
-    from . import foothold_candidates, foothold_costs, foothold_geometry
+    from . import foothold_costs, foothold_geometry
 
-    raibert_xy = raibert_xy_w[..., :2]
-    b, num_feet, _ = raibert_xy.shape
+    nominal_xy = nominal_xy_w[..., :2]
+    b, num_feet, _ = nominal_xy.shape
+    if candidate_terrain_xyz_w.shape[:2] != (b, num_feet):
+        raise ValueError("nominal_xy_w and candidate_terrain_xyz_w must share (B, F).")
+    if ray_hits_w.shape[0] != b:
+        raise ValueError("ray_hits_w batch must match nominal_xy_w.")
     if target_yaw.shape != (b, num_feet):
         raise ValueError(f"target_yaw must be (B, F), got {target_yaw.shape}.")
 
-    candidates_terrain, in_bounds = foothold_candidates.generate_candidates(
-        raibert_xy,
-        ray_hits_w,
-        grid_center_w,
-        grid_yaw,
-        grid_shape=grid_shape,
-        grid_resolution=grid_resolution,
-        half_width_cells=half_width_cells,
-    )
-    k_c = candidates_terrain.shape[2]
-    candidates_fb = candidates_terrain.clone()
-    candidates_fb[..., 2] = candidates_terrain[..., 2] - sole_z_offset
+    k_c = candidate_terrain_xyz_w.shape[2]
+    if k_c <= 0:
+        raise ValueError("candidate_terrain_xyz_w must contain at least one candidate.")
+
+    valid_candidates = candidate_mask.bool()
+    candidates_fb = candidate_terrain_xyz_w.clone()
+    candidates_fb[..., 2] = candidate_terrain_xyz_w[..., 2] - sole_z_offset
 
     flat_centers = candidates_fb.reshape(b, num_feet * k_c, 3)
     flat_yaws = target_yaw.unsqueeze(-1).expand(b, num_feet, k_c).reshape(b, num_feet * k_c)
@@ -440,11 +451,11 @@ def select_foothold_v2(
         candidates_fb, stance_terrain_z_w, max_dz=max_step_dz, sole_z_offset=sole_z_offset
     )
     rough_valid = roughness_cap_mask(dz_omega, max_dz_omega=max_dz_omega)
-    valid = reach_valid & height_valid & rough_valid & in_bounds
+    valid = reach_valid & height_valid & rough_valid & valid_candidates
     valid_count = valid.sum(dim=-1).long()
     used_fallback = valid_count == 0
 
-    j_nom = foothold_costs.cost_nominal(candidates_fb, raibert_xy, sigma_nominal=sigma_nominal)
+    j_nom = foothold_costs.cost_nominal(candidates_fb, nominal_xy, sigma_nominal=sigma_nominal)
     j_reach = foothold_costs.cost_reach(candidates_fb, body_pos_w, body_yaw)
     j_terrain = foothold_costs.cost_terrain(dz_omega, sigma_rough=sigma_rough)
     j_edge = foothold_costs.cost_edge(
@@ -508,7 +519,116 @@ def select_foothold_v2(
             "reach_valid_count": reach_valid.sum(dim=-1),
             "step_height_valid_count": height_valid.sum(dim=-1),
             "roughness_valid_count": rough_valid.sum(dim=-1),
-            "in_bounds_valid_count": in_bounds.sum(dim=-1),
+            "in_bounds_valid_count": valid_candidates.sum(dim=-1),
             "combined_valid_count": valid_count,
         }
     return result
+
+
+def select_foothold_v2(
+    raibert_xy_w: torch.Tensor,
+    ray_hits_w: torch.Tensor,
+    body_pos_w: torch.Tensor,
+    body_yaw: torch.Tensor,
+    target_yaw: torch.Tensor,
+    stance_terrain_z_w: torch.Tensor,
+    *,
+    grid_shape: tuple[int, int],
+    grid_resolution: float,
+    grid_center_w: torch.Tensor,
+    grid_yaw: torch.Tensor,
+    half_width_cells: int = 2,
+    foot_length: float = 0.18,
+    foot_width: float = 0.065,
+    n_long: int = 4,
+    n_lat: int = 3,
+    support_threshold: float = 0.03,
+    sole_z_offset: float = G1_SOLE_Z_OFFSET,
+    reach_x_range: tuple[float, float] = (-0.12, 0.35),
+    reach_y_range_left: tuple[float, float] = (0.06, 0.28),
+    reach_y_range_right: tuple[float, float] = (-0.28, -0.06),
+    max_step_dz: float = 0.20,
+    max_dz_omega: float = 0.10,
+    w_terrain: float = 1.0,
+    w_nominal: float = 0.5,
+    w_reach: float = 1.0,
+    w_height: float = 0.5,
+    w_edge: float = 1.0,
+    w_slope: float = 0.3,
+    lambda_support: float = 1.0,
+    lambda_overhang: float = 2.0,
+    sigma_nominal: float = 0.10,
+    sigma_rough: float = 0.05,
+    sigma_h: float = 0.10,
+    sigma_theta_rad: float = _SLOPE_SCORE_SIGMA,
+    fallback_hip_y: float = 0.12,
+    fallback_leg_length: float = 0.78,
+    enable_fallback: bool = True,
+    return_mask_debug: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Planner V2 foothold selector: fixed grid candidates + patch stats + hard filters + soft costs.
+
+    ``body_pos_w`` / ``body_yaw`` should be the **landing-time** pelvis pose per foot
+    ``(B, F, 3)`` / ``(B, F)`` when horizons differ across feet; using the current
+    pelvis with long-horizon Raibert priors falsely rejects stance-foot candidates.
+    """
+    if grid_center_w is None or grid_yaw is None:
+        raise ValueError("select_foothold_v2 requires grid_center_w and grid_yaw (Task 0.1 contract).")
+    if raibert_xy_w.shape[-1] not in (2, 3):
+        raise ValueError(
+            f"raibert_xy_w last dim must be 2 (xy) or 3 (xyz prior); got shape {tuple(raibert_xy_w.shape)}."
+        )
+
+    from . import foothold_candidates
+
+    raibert_xy = raibert_xy_w[..., :2]
+    candidates_terrain, in_bounds = foothold_candidates.generate_candidates(
+        raibert_xy,
+        ray_hits_w,
+        grid_center_w,
+        grid_yaw,
+        grid_shape=grid_shape,
+        grid_resolution=grid_resolution,
+        half_width_cells=half_width_cells,
+    )
+    return score_foothold_candidates_v2(
+        raibert_xy,
+        candidates_terrain,
+        in_bounds,
+        ray_hits_w,
+        body_pos_w=body_pos_w,
+        body_yaw=body_yaw,
+        target_yaw=target_yaw,
+        stance_terrain_z_w=stance_terrain_z_w,
+        grid_shape=grid_shape,
+        grid_resolution=grid_resolution,
+        grid_center_w=grid_center_w,
+        grid_yaw=grid_yaw,
+        foot_length=foot_length,
+        foot_width=foot_width,
+        n_long=n_long,
+        n_lat=n_lat,
+        support_threshold=support_threshold,
+        sole_z_offset=sole_z_offset,
+        reach_x_range=reach_x_range,
+        reach_y_range_left=reach_y_range_left,
+        reach_y_range_right=reach_y_range_right,
+        max_step_dz=max_step_dz,
+        max_dz_omega=max_dz_omega,
+        w_terrain=w_terrain,
+        w_nominal=w_nominal,
+        w_reach=w_reach,
+        w_height=w_height,
+        w_edge=w_edge,
+        w_slope=w_slope,
+        lambda_support=lambda_support,
+        lambda_overhang=lambda_overhang,
+        sigma_nominal=sigma_nominal,
+        sigma_rough=sigma_rough,
+        sigma_h=sigma_h,
+        sigma_theta_rad=sigma_theta_rad,
+        fallback_hip_y=fallback_hip_y,
+        fallback_leg_length=fallback_leg_length,
+        enable_fallback=enable_fallback,
+        return_mask_debug=return_mask_debug,
+    )

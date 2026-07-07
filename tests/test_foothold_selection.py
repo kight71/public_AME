@@ -402,6 +402,94 @@ def test_v2_selected_z_applies_sole_offset(fs):
     assert not out["used_fallback"].any()
 
 
+def test_v2_score_candidates_matches_select(fs):
+    fc = _load_package_module("foothold_candidates")
+    rays, shp = _v2_rays(h=21, w=21)
+    raibert = torch.tensor([[[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]]])
+    kw = _v2_defaults(shp)
+    candidates, mask = fc.generate_candidates(
+        raibert,
+        rays,
+        kw["grid_center_w"],
+        kw["grid_yaw"],
+        grid_shape=kw["grid_shape"],
+        grid_resolution=kw["grid_resolution"],
+        half_width_cells=2,
+    )
+    out_score = fs.score_foothold_candidates_v2(
+        raibert,
+        candidates,
+        mask,
+        rays,
+        return_mask_debug=True,
+        **kw,
+    )
+    out_select = fs.select_foothold_v2(raibert, rays, return_mask_debug=True, **kw)
+
+    for key in ("selected_xyz_w", "foothold_score", "per_cost_debug"):
+        assert torch.allclose(out_score[key], out_select[key])
+    for key in ("valid_count", "used_fallback"):
+        assert torch.equal(out_score[key], out_select[key])
+    for key in out_select["mask_debug"]:
+        assert torch.equal(out_score["mask_debug"][key], out_select["mask_debug"][key])
+
+
+def test_v2_terrain_window_flat_no_fallback(fs):
+    fc = _load_package_module("foothold_candidates")
+    rays, shp = _v2_rays(h=21, w=21)
+    raibert = torch.tensor([[[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]]])
+    kw = _v2_defaults(shp)
+    candidates, mask = fc.generate_terrain_window_candidates(
+        raibert,
+        rays,
+        kw["grid_center_w"],
+        kw["grid_yaw"],
+        grid_shape=kw["grid_shape"],
+        grid_resolution=kw["grid_resolution"],
+    )
+    out = fs.score_foothold_candidates_v2(raibert, candidates, mask, rays, **kw)
+    assert candidates.shape == (1, 2, 81, 3)
+    assert mask.all()
+    assert not out["used_fallback"].any()
+    assert out["foothold_score"].min().item() > 0.9
+
+
+def test_v2_terrain_window_step_edge_selects_tread_not_edge(fs):
+    fc = _load_package_module("foothold_candidates")
+
+    def step(x, y):
+        return (x >= 0.0).float() * 0.15
+
+    rays, shp = _v2_rays(h=21, w=21, z_fn=step)
+    raibert = torch.tensor([[[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]]])
+    kw = _v2_defaults(shp)
+    candidates, mask = fc.generate_terrain_window_candidates(
+        raibert,
+        rays,
+        kw["grid_center_w"],
+        kw["grid_yaw"],
+        grid_shape=kw["grid_shape"],
+        grid_resolution=kw["grid_resolution"],
+    )
+    out = fs.score_foothold_candidates_v2(
+        raibert,
+        candidates,
+        mask,
+        rays,
+        w_terrain=2.0,
+        w_nominal=0.0,
+        w_reach=1.0,
+        w_height=5.0,
+        w_edge=1.0,
+        w_slope=0.0,
+        reach_x_range=(-0.25, 0.35),
+        **kw,
+    )
+    assert not out["used_fallback"][0, 0].item()
+    assert out["selected_xyz_w"][0, 0, 0].item() < -0.06
+    assert out["selected_xyz_w"][0, 0, 2].item() == pytest.approx(-SOLE_Z_OFFSET, abs=1e-4)
+
+
 def test_v2_score_zero_on_fallback(fs):
     rays, shp = _v2_rays()
     raibert = torch.tensor([[[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]]])
