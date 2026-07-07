@@ -1055,7 +1055,8 @@ def _configure_planner_lipm_paper_height_mlp_env(
 
     Rewards: ``footstep_landing_tracking`` (eq. 4-22) primary;
     ``footstep_swing_tracking`` disabled for first-pass pipeline validation;
-    ``footstep_contact_phase``=0.1.
+    ``footstep_contact_phase``=0.3 to encourage the planned contact schedule
+    without imposing a full swing-foot trajectory.
 
     Pass ``t_double_support > 0`` for the four-phase gait; widen ``landing_window``
     accordingly (e.g. 0.15 s when ``t_double_support=0.05``).
@@ -1068,7 +1069,7 @@ def _configure_planner_lipm_paper_height_mlp_env(
     r.footstep_landing_tracking.weight = 1.0
     r.footstep_landing_tracking.params["landing_window"] = landing_window
     r.footstep_swing_tracking.weight = 0.0
-    r.footstep_contact_phase.weight = 0.1
+    r.footstep_contact_phase.weight = 0.3
     r.footstep_placement_overlap.weight = 0.0
     r.foothold_penalty.weight = 0.0
 
