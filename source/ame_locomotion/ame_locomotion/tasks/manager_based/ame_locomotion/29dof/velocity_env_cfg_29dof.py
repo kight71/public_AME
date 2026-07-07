@@ -1697,6 +1697,19 @@ class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_TERRAIN_WINDOW(
 
 
 @configclass
+class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_TERRAIN_WINDOW_NOALIVE_VELSTD05(
+    G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_TERRAIN_WINDOW
+):
+    """Terrain-window A/B: remove alive reward and widen forward velocity std."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.alive.weight = 0.0
+        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.5
+
+
+@configclass
 class G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP_FLAT(G1RoughEnvCfg_DTC_PlannerV2_LIPM_PaperMLP):
     """Flat-ground LIPM PaperMLP smoke env for validating the planner/reward pipeline.
 
